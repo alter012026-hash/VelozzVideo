@@ -214,7 +214,18 @@ async def _run_render_task(task_id: str, request: RenderRequest) -> None:
         web = _path_to_web(path)
         _set_status(task_id, stage="done", progress=1.0, message="Concluído", done=True, output=str(path), web_url=web)
     except Exception as exc:  # noqa: BLE001
-        _set_status(task_id, stage="error", error=str(exc), done=True)
+        tb = traceback.format_exc()
+        logger.exception("Render task %s falhou", task_id)
+        log_path = _write_task_error_log(task_id, tb, str(exc))
+        _set_status(
+            task_id,
+            stage="error",
+            error=str(exc),
+            error_trace=tb[-8000:],
+            error_log=str(log_path),
+            error_log_url=_path_to_web(log_path),
+            done=True,
+        )
 
 
 @app.post("/api/render/start")

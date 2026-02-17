@@ -5,6 +5,8 @@ import base64
 import logging
 import uuid
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Callable
@@ -86,6 +88,18 @@ def _decode_data_url(data: str) -> tuple[str, bytes]:
     except IndexError:
         mime = "png"
     ext = mime.split("/")[-1] if "/" in mime else "png"
+    ext = (ext or "png").lower()
+    ext_alias = {
+        "mpeg": "mp3",
+        "mpga": "mp3",
+        "x-wav": "wav",
+        "wave": "wav",
+        "x-m4a": "m4a",
+        "mp4": "m4a",
+        "x-flac": "flac",
+        "x-aiff": "aiff",
+    }
+    ext = ext_alias.get(ext, ext)
     return ext or "png", base64.b64decode(payload)
 
 
@@ -130,11 +144,46 @@ def _prepare_background_music(value: Optional[str]) -> Optional[Path]:
         return None
     if value.startswith("data:"):
         ext, payload = _decode_data_url(value)
-        return _write_asset("audio", payload, ext)
+        path = _write_asset("audio", payload, ext)
+        return _coerce_music_for_moviepy(path)
     path = Path(value)
     if path.exists():
-        return path
+        return _coerce_music_for_moviepy(path)
     return None
+
+
+def _coerce_music_for_moviepy(path: Path) -> Path:
+    """
+    Normaliza arquivo de música para formatos que o MoviePy costuma ler bem.
+    Se extensão for incomum e ffmpeg existir, transcodifica para WAV.
+    """
+    safe_exts = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".webm"}
+    suffix = path.suffix.lower()
+    if suffix in safe_exts:
+        return path
+    if not shutil.which("ffmpeg"):
+        return path
+
+    target = path.with_suffix(".wav")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(path),
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        "-c:a",
+        "pcm_s16le",
+        str(target),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return target if target.exists() else path
+    except Exception:
+        return path
 
 
 def _sanitize_title(value: str) -> str:

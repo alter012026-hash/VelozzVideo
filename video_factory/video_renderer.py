@@ -21,6 +21,7 @@ from moviepy.video.fx.Resize import Resize
 from moviepy.audio.AudioClip import CompositeAudioClip, concatenate_audioclips
 from moviepy.audio.fx.AudioFadeIn import AudioFadeIn
 from moviepy.audio.fx.AudioFadeOut import AudioFadeOut
+from moviepy.audio.fx.MultiplyVolume import MultiplyVolume
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.VideoClip import ImageClip, TextClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
@@ -149,6 +150,48 @@ class VideoBuilder:
             clip = clip.cropped(y_center=clip.h / 2, height=self.height)
         return clip
 
+    def _audio_scale(self, clip: Any, volume: float) -> Any:
+        if clip is None:
+            return clip
+        if abs(float(volume) - 1.0) < 1e-6:
+            return clip
+        if hasattr(clip, "with_volume_scaled"):
+            try:
+                return clip.with_volume_scaled(volume)
+            except Exception:
+                pass
+        if hasattr(clip, "with_effects"):
+            try:
+                return clip.with_effects([MultiplyVolume(float(volume))])
+            except Exception:
+                pass
+        logger.warning("Nao foi possivel ajustar volume do clip de audio; seguindo sem ganho.")
+        return clip
+
+    def _audio_fades(self, clip: Any, fade_in: float, fade_out: float) -> Any:
+        if clip is None:
+            return clip
+        effects = []
+        if fade_in > 0:
+            effects.append(AudioFadeIn(fade_in))
+        if fade_out > 0:
+            effects.append(AudioFadeOut(fade_out))
+        if not effects:
+            return clip
+        if hasattr(clip, "with_effects"):
+            return clip.with_effects(effects)
+        if hasattr(clip, "fx"):
+            for fx in effects:
+                clip = clip.fx(fx)
+        return clip
+
+    def _clip_trim(self, clip: Any, start: float, end: float) -> Any:
+        if hasattr(clip, "subclipped"):
+            return clip.subclipped(start, end)
+        if hasattr(clip, "subclip"):
+            return clip.subclip(start, end)
+        return clip
+
     def _pick_transition(self, index: int) -> str:
         style = self.transition_style
         if style == "mixed":
@@ -191,7 +234,7 @@ class VideoBuilder:
 
         clip = clip.with_effects(video_effects)
         if clip.audio:
-            audio = clip.audio.fx(AudioFadeIn(duration)).fx(AudioFadeOut(duration))
+            audio = self._audio_fades(clip.audio, duration, duration)
             clip = clip.with_audio(audio)
         return clip, max(0.0, float(overlap))
 
@@ -280,13 +323,18 @@ class VideoBuilder:
         current_end = 0.0
         for idx, clip in enumerate(clips):
             overlap = overlaps[idx] if idx < len(overlaps) else 0.0
+            clip_duration = float(getattr(clip, "duration", 0) or getattr(getattr(clip, "audio", None), "duration", 0) or 0)
+            if clip_duration <= 0:
+                clip_duration = 0.1
             start = max(0.0, current_end - max(0.0, overlap))
             clip = clip.with_start(start)
-            current_end = start + (clip.duration or 0)
+            current_end = start + clip_duration
             timeline.append(clip)
 
         base = CompositeVideoClip(timeline, size=(self.width, self.height))
-        return base.subclipped(0, current_end)
+        if current_end <= 0:
+            raise ValueError("Timeline sem duracao valida.")
+        return base.with_duration(current_end)
 
     def _add_background_music(
         self,
@@ -299,15 +347,24 @@ class VideoBuilder:
             logger.warning("Música de fundo não encontrada: %s", music_path)
             return video
 
-        music = AudioFileClip(str(music_path))
+        try:
+            music = AudioFileClip(str(music_path))
+        except Exception:
+            logger.exception("Falha ao abrir musica de fundo: %s", music_path)
+            return video
+
+        if float(getattr(music, "duration", 0) or 0) <= 0:
+            logger.warning("Musica de fundo com duracao invalida: %s", music_path)
+            return video
         fade = min(fade_duration, music.duration * 0.3, video.duration * 0.2)
-        music = music.fx(AudioFadeIn(fade)).fx(AudioFadeOut(fade)).volumex(volume)
+        music = self._audio_fades(music, fade, fade)
+        music = self._audio_scale(music, volume)
         loops = []
         t = 0.0
         while t < video.duration:
             loops.append(music.with_start(t))
-            t += music.duration
-        looped = CompositeAudioClip(loops).subclip(0, video.duration)
+            t += max(0.05, float(music.duration))
+        looped = self._clip_trim(CompositeAudioClip(loops), 0, video.duration)
         final_audio = CompositeAudioClip([video.audio, looped] if video.audio else [looped])
         return video.with_audio(final_audio)
 
@@ -330,16 +387,22 @@ class VideoBuilder:
         clips = []
         overlaps: List[float] = []
         for index, (visual_path, audio_path) in enumerate(zip(visual_paths, audio_paths)):
-            audio_clip = AudioFileClip(str(audio_path)).volumex(self.narration_volume)
+            audio_clip = self._audio_scale(AudioFileClip(str(audio_path)), self.narration_volume)
+            scene_duration = float(getattr(audio_clip, "duration", 0) or 0)
+            if scene_duration <= 0:
+                logger.warning("Audio da cena %s com duracao invalida; usando fallback.", index + 1)
+                scene_duration = 0.1
             animation = scene_effects[index] if scene_effects and index < len(scene_effects) else None
             transition = scene_transitions[index] if scene_transitions and index < len(scene_transitions) else None
             color_filter = scene_filters[index] if scene_filters and index < len(scene_filters) else None
             video_clip = self._build_visual_clip(
                 visual_path=visual_path,
-                duration=audio_clip.duration,
+                duration=scene_duration,
                 animation_type=animation,
                 color_filter=color_filter,
             )
+            if not getattr(video_clip, "duration", None) and scene_duration > 0:
+                video_clip = video_clip.with_duration(scene_duration)
             video_clip = video_clip.with_audio(audio_clip)
             timings = scene_word_timings[index] if scene_word_timings and index < len(scene_word_timings) else []
             if timings:
@@ -350,7 +413,7 @@ class VideoBuilder:
             video_clip, overlap = self._apply_transition_effects(video_clip, index, transition_override=transition)
             clips.append(video_clip)
             overlaps.append(overlap)
-            duration += audio_clip.duration
+            duration += scene_duration
 
         final_video = self._assemble_timeline(clips, overlaps)
         if background_music_path:
@@ -667,8 +730,10 @@ def _make_placeholder_image(text: str, format_ratio: str) -> Path:
     except Exception:
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
-    tw, th = draw.textsize(title, font=font_big)
-    sw, sh = draw.textsize(subtitle, font=font_small)
+    title_box = draw.textbbox((0, 0), title, font=font_big)
+    subtitle_box = draw.textbbox((0, 0), subtitle, font=font_small)
+    tw, th = title_box[2] - title_box[0], title_box[3] - title_box[1]
+    sw, sh = subtitle_box[2] - subtitle_box[0], subtitle_box[3] - subtitle_box[1]
     draw.text(((width - tw) / 2, height * 0.38), title, font=font_big, fill=(235, 242, 255))
     draw.text(((width - sw) / 2, height * 0.55), subtitle, font=font_small, fill=(144, 199, 255))
     target = config.ASSETS_DIR / "cache" / f"preview_{uuid.uuid4().hex}.png"
@@ -678,14 +743,23 @@ def _make_placeholder_image(text: str, format_ratio: str) -> Path:
 
 
 def _make_silent_audio(duration: float) -> Path:
+    import wave
+    import struct
+
     duration = max(0.8, float(duration))
+    sample_rate = 44100
+    n_channels = 1
+    sample_width = 2
+    n_frames = int(sample_rate * duration)
     path = config.ASSETS_DIR / "cache" / f"preview_silence_{uuid.uuid4().hex}.wav"
-    def frame_func(t):
-        return 0.0
-    clip = AudioClip(frame_func, duration=duration, fps=44100)
     path.parent.mkdir(parents=True, exist_ok=True)
-    clip.write_audiofile(str(path), fps=44100, nbytes=2, codec="pcm_s16le", logger=None)
-    clip.close()
+
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(n_channels)
+        wav.setsampwidth(sample_width)
+        wav.setframerate(sample_rate)
+        silence_frame = struct.pack("<h", 0)
+        wav.writeframes(silence_frame * n_frames)
     return path
 
 

@@ -1078,7 +1078,13 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         setStatusMessage(st.message || '');
         if (st.done) {
           done = true;
-          if (st.error) throw new Error(st.error);
+          if (st.error) {
+            if (st.error_log_url) {
+              const logUrl = st.error_log_url.startsWith('/') && apiBase ? `${apiBase}${st.error_log_url}` : st.error_log_url;
+              pushLog(`Log do erro: ${logUrl}`, 'error');
+            }
+            throw new Error(st.error_log_url ? `${st.error} | log: ${st.error_log_url}` : st.error);
+          }
           const rawUrl = st.web_url || st.output || null;
           const finalUrl = rawUrl && rawUrl.startsWith('/') && apiBase ? `${apiBase}${rawUrl}` : rawUrl;
           setVideoUrl(finalUrl);

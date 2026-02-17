@@ -5,6 +5,9 @@ set ROOT=%~dp0
 set VENV=%ROOT%video_factory\.venv\Scripts
 set API_READY=0
 
+echo [0/4] Encerrando APIs antigas (uvicorn video_factory.api) para evitar codigo stale...
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -like 'python*') -and ($_.CommandLine -match 'uvicorn\\s+video_factory\\.api:app') } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Host ('[INFO] Finalizado PID ' + $_.ProcessId) } catch {} }"
+
 if not exist "%VENV%\python.exe" (
   echo [WARN] Venv nao encontrado. Criando em video_factory\.venv...
   where python >nul 2>&1
@@ -46,7 +49,7 @@ start "ollama-serve" cmd /c "ollama serve"
 timeout /t 2 >nul
 
 echo [2/4] Subindo API FastAPI/uvicorn na porta %API_PORT%...
-start "velozz-api" cmd /c "cd /d %ROOT% && set TTS_PROVIDER=edge,offline && %VENV%\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port %API_PORT%"
+start "velozz-api" cmd /c "cd /d %ROOT% && set TTS_PROVIDER=edge,offline && %VENV%\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port %API_PORT% --reload"
 
 echo [2.5/4] Aguardando API responder para evitar erro do Vite...
 for /l %%I in (1,1,10) do (
