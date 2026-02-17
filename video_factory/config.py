@@ -14,6 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = ROOT_DIR / "assets"
 CACHE_DIR = ASSETS_DIR / "cache"
 CAPTIONS_DIR = ASSETS_DIR / "captions"
+ROOT_DIR = ROOT_DIR
 
 # Carrega variáveis do .env na raiz do projeto
 load_dotenv(dotenv_path=ROOT_DIR.parent / ".env.local")
@@ -71,6 +72,17 @@ VIDEO_CODEC = CODEC
 VIDEO_AUDIO_CODEC = AUDIO_CODEC
 VIDEO_PRESET = env("VIDEO_PRESET", "veryfast")
 VIDEO_THREADS = int(env("VIDEO_THREADS", str(max(4, multiprocessing.cpu_count() or 4))))
+
+# Legendas / mixagem
+CAPTION_FONT_SCALE = float(env("CAPTION_FONT_SCALE", "1.0"))  # multiplicador sobre tamanho base
+CAPTION_BG_OPACITY = float(env("CAPTION_BG_OPACITY", "0.55"))
+CAPTION_COLOR = env("CAPTION_COLOR", "#FFFFFF")
+CAPTION_HIGHLIGHT_COLOR = env("CAPTION_HIGHLIGHT_COLOR", "#ffd166")
+CAPTION_Y_PCT = float(env("CAPTION_Y_PCT", "0.82"))  # posiÃ§Ã£o vertical (0-1)
+NARRATION_VOLUME = float(env("NARRATION_VOLUME", "1.0"))
+MUSIC_VOLUME = float(env("MUSIC_VOLUME", "0.25"))
+KARAOKE_MAX_HIGHLIGHTS = int(env("KARAOKE_MAX_HIGHLIGHTS", "80"))
+KARAOKE_MIN_HOLD = float(env("KARAOKE_MIN_HOLD", "0.08"))
 
 ANIMATION_INTENSITY = float(env("ANIMATION_INTENSITY", "0.35"))
 FADE_DURATION = float(env("FADE_DURATION", "0.6"))

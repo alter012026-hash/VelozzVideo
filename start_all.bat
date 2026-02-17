@@ -3,6 +3,30 @@ setlocal
 REM === Paths ===
 set ROOT=%~dp0
 set VENV=%ROOT%video_factory\.venv\Scripts
+set API_READY=0
+
+if not exist "%VENV%\python.exe" (
+  echo [WARN] Venv nao encontrado. Criando em video_factory\.venv...
+  where python >nul 2>&1
+  if errorlevel 1 (
+    echo [ERRO] Python nao encontrado no PATH.
+    pause
+    exit /b 1
+  )
+  python -m venv "%ROOT%video_factory\.venv"
+  if errorlevel 1 (
+    echo [ERRO] Falha ao criar venv.
+    pause
+    exit /b 1
+  )
+  echo [INFO] Instalando dependencias Python...
+  "%VENV%\python.exe" -m pip install -r "%ROOT%video_factory\requirements.txt"
+  if errorlevel 1 (
+    echo [ERRO] Falha ao instalar requirements.
+    pause
+    exit /b 1
+  )
+)
 
 REM --- Seleciona porta livre para API (tenta 8000-8010) ---
 set API_PORT=8000
@@ -23,6 +47,24 @@ timeout /t 2 >nul
 
 echo [2/4] Subindo API FastAPI/uvicorn na porta %API_PORT%...
 start "velozz-api" cmd /c "cd /d %ROOT% && set TTS_PROVIDER=edge,offline && %VENV%\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port %API_PORT%"
+
+echo [2.5/4] Aguardando API responder para evitar erro do Vite...
+for /l %%I in (1,1,10) do (
+  powershell -Command "try { iwr http://127.0.0.1:%API_PORT%/api/ping -UseBasicParsing -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }"
+  if not errorlevel 1 (
+    set API_READY=1
+    goto api_up
+  )
+  timeout /t 1 >nul
+)
+:api_up
+if "%API_READY%"=="0" (
+  echo [ERRO] API nao respondeu em http://127.0.0.1:%API_PORT%/api/ping
+  echo [ERRO] Verifique a janela "velozz-api" para identificar a causa.
+  echo [ERRO] Frontend nao sera iniciado para evitar erro de proxy do Vite.
+  pause
+  exit /b 1
+)
 
 echo [3/4] Subindo frontend Vite (npm run dev)...
 start "velozz-front" cmd /c "cd /d %ROOT% && set API_HOST=%API_HOST% && npm run dev"

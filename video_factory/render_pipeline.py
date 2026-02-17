@@ -16,6 +16,7 @@ from video_factory import config
 from video_factory.tts_generator import synthesize_to_bytes_with_metadata
 from video_factory.tts_metadata import WordTiming, word_timings_from_chunks
 from video_factory.video_renderer import VideoBuilder
+from video_factory.video_renderer import run_ffmpeg_filtergraph
 
 logger = logging.getLogger("render_pipeline")
 if not logger.handlers:
@@ -38,6 +39,8 @@ class RenderScene(BaseModel):
     visualPrompt: Optional[str] = None
     localImage: Optional[str] = None
     animationType: Optional[str] = None
+    transition: Optional[str] = None
+    filter: Optional[str] = None
 
 
 class RenderRequest(BaseModel):
@@ -50,8 +53,18 @@ class RenderRequest(BaseModel):
     transitionDuration: Optional[float] = None
     colorFilter: Optional[str] = None
     colorStrength: float = 0.35
-    musicVolume: float = 0.25
+    musicVolume: float = config.MUSIC_VOLUME
+    narrationVolume: float = config.NARRATION_VOLUME
+    captionFontScale: float = config.CAPTION_FONT_SCALE
+    captionBgOpacity: float = config.CAPTION_BG_OPACITY
+    captionColor: str = config.CAPTION_COLOR
+    captionHighlightColor: str = config.CAPTION_HIGHLIGHT_COLOR
+    captionYPct: float = config.CAPTION_Y_PCT
     scriptTitle: Optional[str] = None
+    ffmpegFilters: Optional[str] = None  # filtergraph opcional aplicado pós-render
+    stabilize: bool = False  # tentativa de estabilização (se libs disponíveis)
+    aiEnhance: bool = False  # placeholder p/ futura upscale/denoise
+    engine: Optional[str] = None  # moviepy | movielite (quando disponível)
 
 
 @dataclass
@@ -59,6 +72,8 @@ class SceneAsset:
     image_path: Path
     audio_path: Path
     animation: Optional[str]
+    transition: Optional[str]
+    color_filter: Optional[str]
     word_timings: List[WordTiming]
 
 
@@ -156,7 +171,16 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
         audio_bytes, metadata, audio_ext = await synthesize_to_bytes_with_metadata(scene.text, voice)
         audio_path = _write_asset("audio", audio_bytes, audio_ext or "mp3")
         timings = word_timings_from_chunks(metadata)
-        scene_assets.append(SceneAsset(image_path=image_path, audio_path=audio_path, animation=scene.animationType, word_timings=timings))
+        scene_assets.append(
+            SceneAsset(
+                image_path=image_path,
+                audio_path=audio_path,
+                animation=scene.animationType,
+                transition=scene.transition,
+                color_filter=scene.filter,
+                word_timings=timings,
+            )
+        )
         _progress("tts", (idx + 1) / total_scenes, f"Narração cena {idx+1}/{total_scenes}")
     logger.info("[1/5] Narracoes concluidas")
 
@@ -168,6 +192,13 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
         transition_duration=request.transitionDuration,
         color_filter=request.colorFilter,
         color_strength=request.colorStrength,
+        narration_volume=request.narrationVolume,
+        music_volume=request.musicVolume,
+        caption_font_scale=request.captionFontScale,
+        caption_bg_opacity=request.captionBgOpacity,
+        caption_color=request.captionColor,
+        caption_highlight=request.captionHighlightColor,
+        caption_y_pct=request.captionYPct,
     )
 
     logger.info("[3/5] Resolvendo musica de fundo")
@@ -190,10 +221,25 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
             music_volume=request.musicVolume,
             scene_effects=[asset.animation for asset in scene_assets],
             scene_word_timings=[asset.word_timings for asset in scene_assets],
+            scene_transitions=[asset.transition for asset in scene_assets],
+            scene_filters=[asset.color_filter for asset in scene_assets],
         )
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _build)
+
+    # Pós-processamento opcional com FFmpeg filtergraph (não bloqueia render principal)
+    if request.ffmpegFilters:
+        try:
+            _progress("post", 0.2, "Aplicando filtros FFmpeg")
+            filtered = await loop.run_in_executor(None, run_ffmpeg_filtergraph, result, request.ffmpegFilters)
+            if filtered:
+                result = filtered
+            _progress("post", 1.0, "Filtros aplicados")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("FFmpeg filters falharam: %s", exc)
+            _progress("post", 1.0, "Filtros ignorados")
+
     _progress("render", 1.0, "Render finalizado")
     logger.info("[5/5] Render finalizado: %s", result)
     return result

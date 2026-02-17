@@ -38,6 +38,8 @@ def _build_request(topic: str, aspect: str, duration: int, scenes: int | None) -
                 visualPrompt=str(vp),
                 localImage=scene.get("localImage"),
                 animationType=scene.get("animationType"),
+                transition=scene.get("transition"),
+                filter=scene.get("filter"),
             )
         )
 

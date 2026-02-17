@@ -17,6 +17,10 @@ export default defineConfig(({ mode }) => {
           '/api': {
             target: env.API_HOST || 'http://127.0.0.1:8000',
             changeOrigin: true
+          },
+          '/assets': {
+            target: env.API_HOST || 'http://127.0.0.1:8000',
+            changeOrigin: true
           }
         }
       },

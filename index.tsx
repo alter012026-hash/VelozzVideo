@@ -42,6 +42,10 @@ interface SessionPayload {
   topic: string;
   format: '16:9' | '9:16';
   videoLength: '1m' | '5m';
+  ffmpegFilters?: string;
+  stabilize?: boolean;
+  aiEnhance?: boolean;
+  engine?: string;
   settings: GeneralSettings;
   script: Script | null;
   scenePositions: Record<string, { x: number; y: number }>;
@@ -66,6 +70,23 @@ const App: React.FC = () => {
     { id: 'slide_up', label: 'Slide Up' },
     { id: 'slide_down', label: 'Slide Down' },
     { id: 'none', label: 'Sem transição' },
+  ];
+  const animationOptions = [
+    { id: 'kenburns', label: 'Ken Burns' },
+    { id: 'zoom_in', label: 'Zoom In' },
+    { id: 'zoom_out', label: 'Zoom Out' },
+    { id: 'zoom_in_fast', label: 'Zoom In Rápido' },
+    { id: 'zoom_out_fast', label: 'Zoom Out Rápido' },
+    { id: 'pan_left', label: 'Pan Left' },
+    { id: 'pan_right', label: 'Pan Right' },
+    { id: 'pan_up', label: 'Pan Up' },
+    { id: 'pan_down', label: 'Pan Down' },
+    { id: 'rotate_left', label: 'Rotate Left' },
+    { id: 'rotate_right', label: 'Rotate Right' },
+    { id: 'sway', label: 'Sway' },
+    { id: 'pulse', label: 'Pulse' },
+    { id: 'warp_in', label: 'Warp In' },
+    { id: 'warp_out', label: 'Warp Out' },
   ];
   const filterOptions = [
     { id: 'none', label: 'Nenhum' },
@@ -104,6 +125,27 @@ const App: React.FC = () => {
   const [cleanupAgeDays, setCleanupAgeDays] = useState<number>(7);
   const [cleanupResult, setCleanupResult] = useState<string | null>(null);
   const [isCleaningCache, setIsCleaningCache] = useState(false);
+  const [captionScale, setCaptionScale] = useState<number>(1);
+  const [captionBg, setCaptionBg] = useState<number>(0.55);
+  const [captionColor, setCaptionColor] = useState<string>('#ffffff');
+  const [captionHighlight, setCaptionHighlight] = useState<string>('#ffd166');
+  const [captionY, setCaptionY] = useState<number>(82); // porcentagem
+  const [musicVolume, setMusicVolume] = useState<number>(0.25);
+  const [narrationVolume, setNarrationVolume] = useState<number>(1);
+  const [colorStrength, setColorStrength] = useState<number>(0.35);
+  const [transitionDuration, setTransitionDuration] = useState<number>(0.6);
+  const [previewTransition, setPreviewTransition] = useState<string>('crossfade');
+  const [previewFilter, setPreviewFilter] = useState<string>('cinematic');
+  const [previewAnimation, setPreviewAnimation] = useState<string>('kenburns');
+  const [previewColorStrength, setPreviewColorStrength] = useState<number>(0.5);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [isPreviewRendering, setIsPreviewRendering] = useState<boolean>(false);
+  const [previewFilters, setPreviewFilters] = useState<string>('');
+  const backendWarnRef = useRef<number>(0);
+  const [ffmpegFilters, setFfmpegFilters] = useState<string>('');
+  const [stabilize, setStabilize] = useState<boolean>(false);
+  const [aiEnhance, setAiEnhance] = useState<boolean>(false);
+  const [engine, setEngine] = useState<string>('moviepy');
   const staticEdgeVoices = [
     { id: 'pt-BR-ThalitaMultilingualNeural', label: 'ThalitaMultilingualNeural', gender: 'Female', locale: 'pt-BR' },
     { id: 'pt-BR-FranciscaNeural', label: 'FranciscaNeural', gender: 'Female', locale: 'pt-BR' },
@@ -121,6 +163,7 @@ const App: React.FC = () => {
     voice: true,
     backend: true,
     grid: true,
+    advanced: true,
   });
 
   const toggleSection = (key: keyof typeof openSections) =>
@@ -159,11 +202,13 @@ const App: React.FC = () => {
       const envBase = (import.meta as any).env?.API_HOST || (import.meta as any).env?.VITE_API_HOST;
       const portRange = Array.from({ length: 11 }, (_, i) => 8000 + i);
       const portCandidates = portRange.flatMap(p => [`http://127.0.0.1:${p}`, `http://localhost:${p}`]);
+
+      // Prioriza checar direto nos ports comuns antes de tentar o proxy do dev server, reduzindo erros ECONNREFUSED no console.
       const candidates = [
+        ...portCandidates,
         saved,
         envBase,
-        window.location.origin,
-        ...portCandidates,
+        window.location.origin, // por último, pois passa pelo proxy do Vite
       ].filter(Boolean) as string[];
 
       for (const base of candidates) {
@@ -180,6 +225,7 @@ const App: React.FC = () => {
             return;
           }
         } catch (err) {
+          // Apenas segue para o próximo candidato; evita spam de erro
           continue;
         }
       }
@@ -194,6 +240,19 @@ const App: React.FC = () => {
   const apiFetch = (path: string, options?: RequestInit) => {
     if (!apiBase) throw new Error('API indisponível');
     return fetch(`${apiBase}${path}`, options);
+  };
+
+  const ensureApiOrWarn = () => {
+    if (apiBase) return true;
+    const now = Date.now();
+    // evita spam: só avisa a cada 2 minutos
+    if (now - backendWarnRef.current > 120000) {
+      backendWarnRef.current = now;
+      const hint = 'Backend não encontrado. Inicie: cd video_factory; .\\.venv\\Scripts\\Activate.ps1; uvicorn api:app --reload --port 8000 (ou use start_all.bat)';
+      setStatusMessage('API indisponível para requisições.');
+      pushLog(hint, 'warn');
+    }
+    return false;
   };
 
   const pushLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') => {
@@ -238,12 +297,16 @@ const App: React.FC = () => {
 
   const sceneIdKey = script ? script.scenes.map(s => s.id).join('|') : '';
 
-  const applySessionPayload = (payload: SessionPayload | null): boolean => {
+const applySessionPayload = (payload: SessionPayload | null): boolean => {
     if (!payload) return false;
     setTopic(payload.topic ?? '');
     setFormat(payload.format ?? '16:9');
     setVideoLength(payload.videoLength ?? '1m');
     setSettings(prev => payload.settings ? { ...prev, ...payload.settings } : prev);
+    if (payload.ffmpegFilters !== undefined) setFfmpegFilters(payload.ffmpegFilters);
+    if (payload.stabilize !== undefined) setStabilize(payload.stabilize);
+    if (payload.aiEnhance !== undefined) setAiEnhance(payload.aiEnhance);
+    if (payload.engine) setEngine(payload.engine);
     setScenePositions(payload.scenePositions || {});
     setGridRows(payload.gridRows || 2);
     setGridCols(payload.gridCols || 3);
@@ -333,6 +396,10 @@ const App: React.FC = () => {
       topic,
       format,
       videoLength,
+      ffmpegFilters,
+      stabilize,
+      aiEnhance,
+      engine,
       settings,
       script,
       scenePositions,
@@ -580,6 +647,7 @@ const App: React.FC = () => {
   const previewVoice = async () => {
     setIsPreviewingVoice(true);
     try {
+      if (!ensureApiOrWarn()) return;
       localStorage.setItem('edge_voice', edgeVoiceId);
       const res = await apiFetch(`/api/tts/preview?text=${encodeURIComponent(previewText || 'Previa de voz')}&voice=${encodeURIComponent(edgeVoiceId)}`);
       if (!res.ok) {
@@ -593,9 +661,57 @@ const App: React.FC = () => {
       audio.play();
       pushLog(`Previa de voz ${usedVoice}`, 'info');
     } catch (err: any) {
-      pushLog(`Falha na prévia de voz: ${err?.message || err}`, 'error');
+      const msg = err?.message || String(err);
+      const isConn = /failed to fetch|network|ECONNREFUSED|API indisponível/i.test(msg);
+      if (isConn) {
+        // já avisado por ensureApiOrWarn; não spammar
+        setStatusMessage(prev => prev || 'Inicie o backend para habilitar prévia de voz.');
+      } else {
+        pushLog(`Falha na prévia de voz: ${msg}`, 'error');
+      }
     } finally {
       setIsPreviewingVoice(false);
+    }
+  };
+
+  const previewVideoEffects = async () => {
+    if (isPreviewRendering) return;
+    if (!ensureApiOrWarn()) return;
+    setIsPreviewRendering(true);
+    setStatusMessage('Gerando prévia curta de efeitos...');
+    try {
+      const payload = {
+        format,
+        transition: previewTransition,
+        filter: previewFilter,
+        colorStrength: previewColorStrength,
+        animationType: previewAnimation,
+        captionText: previewText || 'Prévia de efeitos',
+        duration: 3.5,
+        ffmpegFilters: previewFilters || undefined,
+        stabilize,
+        aiEnhance,
+        engine,
+      };
+      const res = await apiFetch('/api/render/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const url = data.web_url && apiBase ? `${apiBase}${data.web_url}` : data.output;
+      setPreviewUrl(url || null);
+      pushLog('Prévia de efeitos gerada (3-4s)', 'info');
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      pushLog(`Falha ao gerar prévia: ${msg}`, 'error');
+      setStatusMessage(`Prévia falhou: ${msg}`);
+    } finally {
+      setIsPreviewRendering(false);
     }
   };
 
@@ -607,10 +723,7 @@ const App: React.FC = () => {
   };
 
   const cleanupCache = async () => {
-    if (!apiBase) {
-      setStatusMessage('API indisponÃ­vel para limpeza de cache');
-      return;
-    }
+    if (!ensureApiOrWarn()) return;
     setIsCleaningCache(true);
     setCleanupResult(null);
     try {
@@ -886,7 +999,8 @@ const App: React.FC = () => {
   const generateFullVideo = async () => {
     if (!script) return;
     if (!apiBase) {
-      setStatusMessage('API indisponível para render');
+      setStatusMessage('API indisponível para render. Inicie o backend: "cd video_factory; .\\.venv\\Scripts\\Activate.ps1; uvicorn api:app --reload --port 8000".');
+      pushLog('Backend não encontrado. Inicie uvicorn em 127.0.0.1:8000 (ou 8001+) e recarregue.', 'error');
       return;
     }
 
@@ -920,6 +1034,23 @@ const App: React.FC = () => {
         format,
         voice: edgeVoiceId,
         scriptTitle: script.title,
+        backgroundMusic: settings.localBackgroundMusic
+          || (settings.backgroundMusic && settings.backgroundMusic.startsWith('data:') ? settings.backgroundMusic : undefined),
+        transitionStyle: settings.defaultTransition || 'mixed',
+        colorFilter: settings.defaultFilter || 'none',
+        musicVolume,
+        narrationVolume,
+        colorStrength,
+        transitionDuration,
+        captionFontScale: captionScale,
+        captionBgOpacity: captionBg,
+        captionColor,
+        captionHighlightColor: captionHighlight,
+        captionYPct: captionY / 100,
+        ffmpegFilters: ffmpegFilters || undefined,
+        stabilize,
+        aiEnhance,
+        engine,
       };
 
       const startRes = await apiFetch('/api/render/start', {
@@ -948,9 +1079,13 @@ const App: React.FC = () => {
         if (st.done) {
           done = true;
           if (st.error) throw new Error(st.error);
-          const url = st.web_url || st.output || null;
-          setVideoUrl(url);
-          pushLog(`Render concluído: ${url || st.output}`, 'info');
+          const rawUrl = st.web_url || st.output || null;
+          const finalUrl = rawUrl && rawUrl.startsWith('/') && apiBase ? `${apiBase}${rawUrl}` : rawUrl;
+          setVideoUrl(finalUrl);
+          setRenderProgress(100);
+          setRenderStage('Concluído');
+          setStatusMessage('Render concluído');
+          pushLog(`Render concluído: ${finalUrl || rawUrl || st.output}`, 'info');
           setCurrentStep('done');
         } else {
           await new Promise(r => setTimeout(r, 1500));
@@ -961,10 +1096,10 @@ const App: React.FC = () => {
       handleAiError(error, 'Vídeo');
     } finally {
       setIsGeneratingVideo(false);
-      setStatusMessage('');
-      setRenderStage('');
+      if (!videoUrl) setStatusMessage('');
+      setRenderStage(prev => (prev === 'Concluído' ? prev : ''));
       setRenderTaskId(null);
-      setRenderProgress(0);
+      if (!videoUrl) setRenderProgress(0);
     }
   };
 
@@ -981,6 +1116,15 @@ const App: React.FC = () => {
         format,
         voice: edgeVoiceId,
         scriptTitle: 'Teste local',
+        musicVolume,
+        narrationVolume,
+        colorStrength,
+        transitionDuration,
+        captionFontScale: captionScale,
+        captionBgOpacity: captionBg,
+        captionColor,
+        captionHighlightColor: captionHighlight,
+        captionYPct: captionY / 100,
       };
       const response = await apiFetch('/api/render', {
         method: 'POST',
@@ -992,8 +1136,14 @@ const App: React.FC = () => {
         throw new Error(err?.detail || `HTTP ${response.status}`);
       }
       const data = await response.json();
-      pushLog(`Teste de render concluído: ${data.output}`, 'info');
-      setStatusMessage(`Teste completo. Saída: ${data.output}`);
+      const rawUrl = data.web_url || data.output;
+      const finalUrl = rawUrl && rawUrl.startsWith('/') && apiBase ? `${apiBase}${rawUrl}` : rawUrl;
+      setVideoUrl(finalUrl);
+      setRenderProgress(100);
+      setRenderStage('Concluído');
+      setCurrentStep('done');
+      pushLog(`Teste de render concluído: ${finalUrl}`, 'info');
+      setStatusMessage(`Teste completo. Saída: ${finalUrl}`);
     } catch (error: any) {
       handleAiError(error, 'Teste de render');
       setStatusMessage('Falha no teste de render.');
@@ -1147,6 +1297,128 @@ const App: React.FC = () => {
                   </button>
                   <div className="flex-1 text-[10px] text-gray-400 bg-black/30 border border-gray-800 rounded-xl p-2 leading-relaxed">
                     Inclui fades, crossfade, slides e filtros cinematográficos, bw, vhs, matte, vibrant.
+                  </div>
+                </div>
+
+                <div className="mt-3 p-3 rounded-2xl bg-black/30 border border-cyan-500/20">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] uppercase font-black text-cyan-300">Lab de Efeitos (Prévia rápida)</p>
+                    <span className="text-[10px] text-gray-500">MoviePy / FFmpeg</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Transição</label>
+                      <select value={previewTransition} onChange={e => setPreviewTransition(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                        {transitionOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Animação</label>
+                      <select value={previewAnimation} onChange={e => setPreviewAnimation(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                        {animationOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Filtro</label>
+                      <select value={previewFilter} onChange={e => setPreviewFilter(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                        {filterOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Força do filtro ({previewColorStrength.toFixed(2)})</label>
+                      <input type="range" min={0} max={1.5} step={0.05} value={previewColorStrength} onChange={e => setPreviewColorStrength(parseFloat(e.target.value))} className="accent-cyan-400" />
+                    </div>
+                  </div>
+                  <div className="mt-2 flex flex-col gap-1">
+                    <label className="text-[10px] text-gray-500 uppercase font-bold">FFmpeg filtergraph (opcional)</label>
+                    <textarea value={previewFilters} onChange={e => setPreviewFilters(e.target.value)} rows={2} className="w-full bg-black/40 border border-gray-800 rounded-xl px-3 py-2 text-[11px] text-gray-100 outline-none focus:border-cyan-400/70" placeholder="ex: unsharp=luma_msize_x=5:luma_amount=1.2,eq=saturation=1.2" />
+                  </div>
+                  <div className="flex items-center gap-2 mt-3">
+                    <button onClick={previewVideoEffects} disabled={isPreviewRendering} className="px-3 py-2 rounded-xl bg-cyan-600/80 hover:bg-cyan-500 text-white text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
+                      {isPreviewRendering ? 'Gerando...' : 'Gerar prévia'}
+                    </button>
+                    <span className="text-[10px] text-gray-400">MP4 de 3-4s para validar transição + filtro + animação + FFmpeg.</span>
+                  </div>
+                  {previewUrl && (
+                    <div className="mt-3 rounded-xl overflow-hidden border border-cyan-500/30 bg-black/40 p-2">
+                      <video src={previewUrl} className="w-full rounded-lg" controls muted loop playsInline />
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-3 p-3 rounded-2xl bg-black/30 border border-cyan-500/20">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] uppercase font-black text-cyan-300">Lab de Efeitos (Prévia rápida)</p>
+                    <span className="text-[10px] text-gray-500">MoviePy</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Transição</label>
+                      <select value={previewTransition} onChange={e => setPreviewTransition(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                        {transitionOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Animação</label>
+                      <select value={previewAnimation} onChange={e => setPreviewAnimation(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                        {animationOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Filtro</label>
+                      <select value={previewFilter} onChange={e => setPreviewFilter(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                        {filterOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Força do filtro ({previewColorStrength.toFixed(2)})</label>
+                      <input type="range" min={0} max={1.5} step={0.05} value={previewColorStrength} onChange={e => setPreviewColorStrength(parseFloat(e.target.value))} className="accent-cyan-400" />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 mt-3">
+                    <button onClick={previewVideoEffects} disabled={isPreviewRendering} className="px-3 py-2 rounded-xl bg-cyan-600/80 hover:bg-cyan-500 text-white text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
+                      {isPreviewRendering ? 'Gerando...' : 'Gerar prévia'}
+                    </button>
+                    <span className="text-[10px] text-gray-400">Gera MP4 de 3-4s com 2 cenas para validar transição + filtro + animação.</span>
+                  </div>
+                  {previewUrl && (
+                    <div className="mt-3 rounded-xl overflow-hidden border border-cyan-500/30 bg-black/40 p-2">
+                      <video src={previewUrl} className="w-full rounded-lg" controls muted loop playsInline />
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Edição avançada (FFmpeg / Estabilização) */}
+          <div className="glass p-5 rounded-3xl flex flex-col gap-4 border-emerald-500/10 relative overflow-hidden">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-black uppercase text-emerald-300">Edição avançada (pós)</p>
+              <button onClick={() => toggleSection('advanced')} className="text-[11px] text-gray-400 hover:text-white">{openSections.advanced ? '−' : '+'}</button>
+            </div>
+            {openSections.advanced && (
+              <>
+                <label className="text-[10px] text-gray-500 uppercase font-bold">FFmpeg filtergraph (aplica no MP4 final)</label>
+                <textarea value={ffmpegFilters} onChange={e => setFfmpegFilters(e.target.value)} rows={3} className="w-full bg-black/40 border border-gray-800 rounded-xl px-3 py-2 text-[11px] text-gray-100 outline-none focus:border-emerald-400/70" placeholder="ex: unsharp=luma_msize_x=5:luma_amount=1.2,eq=saturation=1.15,curves=psfile=film_lut.acv" />
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex items-center gap-2">
+                    <input id="stabilize" type="checkbox" checked={stabilize} onChange={e => setStabilize(e.target.checked)} className="accent-emerald-400" />
+                    <label htmlFor="stabilize" className="text-[11px] text-gray-200">Estabilizar (VidGear, opcional)</label>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input id="aiEnhance" type="checkbox" checked={aiEnhance} onChange={e => setAiEnhance(e.target.checked)} className="accent-emerald-400" />
+                    <label htmlFor="aiEnhance" className="text-[11px] text-gray-200">AI Enhance (placeholder)</label>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-gray-500 uppercase font-bold">Motor</label>
+                    <select value={engine} onChange={e => setEngine(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-emerald-400/70 transition-all">
+                      <option value="moviepy">MoviePy (padrão)</option>
+                      <option value="movielite">MovieLite (experimental)</option>
+                    </select>
+                  </div>
+                  <div className="text-[10px] text-gray-400 bg-black/30 border border-gray-800 rounded-xl p-2 leading-relaxed">
+                    Os filtros FFmpeg serão aplicados após a montagem. Se ffmpeg não estiver instalado, o render segue sem erro.
                   </div>
                 </div>
               </>
@@ -1738,6 +2010,67 @@ const App: React.FC = () => {
                       </div>
                     </div>
                     {cleanupResult && <p className="text-[10px] text-green-300">{cleanupResult}</p>}
+                  </div>
+
+                  <div className="pt-3 border-t border-gray-800 text-[11px] space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-gray-500 font-mono">Volumes</span>
+                      <div className="flex-1 grid grid-cols-2 gap-3">
+                        <label className="flex flex-col gap-1 text-[10px] text-gray-400">
+                          Música {Math.round(musicVolume * 100)}%
+                          <input type="range" min={0} max={1} step={0.05} value={musicVolume} onChange={(e)=>setMusicVolume(Number(e.target.value))} />
+                        </label>
+                        <label className="flex flex-col gap-1 text-[10px] text-gray-400">
+                          Narração {Math.round(narrationVolume * 100)}%
+                          <input type="range" min={0.3} max={1.5} step={0.05} value={narrationVolume} onChange={(e)=>setNarrationVolume(Number(e.target.value))} />
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-gray-500 font-mono">Legendas</span>
+                      <div className="flex-1 space-y-2">
+                        <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-400">
+                          <label className="flex flex-col gap-1">
+                            Tamanho {captionScale.toFixed(2)}x
+                            <input type="range" min={0.7} max={1.4} step={0.05} value={captionScale} onChange={(e)=>setCaptionScale(Number(e.target.value))} />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            Opacidade BG {Math.round(captionBg*100)}%
+                            <input type="range" min={0} max={1} step={0.05} value={captionBg} onChange={(e)=>setCaptionBg(Number(e.target.value))} />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            Posição Y {captionY}%
+                            <input type="range" min={60} max={90} step={1} value={captionY} onChange={(e)=>setCaptionY(Number(e.target.value))} />
+                          </label>
+                        </div>
+                        <div className="flex items-center gap-3 text-[10px] text-gray-300">
+                          <span>Cor</span>
+                          <input type="color" value={captionColor} onChange={(e)=>setCaptionColor(e.target.value)} />
+                          <span>Destaque</span>
+                          <input type="color" value={captionHighlight} onChange={(e)=>setCaptionHighlight(e.target.value)} />
+                        </div>
+                        <div className="mt-1 p-3 rounded-xl border border-gray-800 bg-black/40 text-center text-[11px]">
+                          <span style={{backgroundColor:`rgba(0,0,0,${captionBg})`, padding:'6px 10px', borderRadius:'10px', display:'inline-block', color: captionColor}}>
+                            LEGENDAS PRÉVIA <span style={{color: captionHighlight}}>DESTAQUE</span>
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-gray-500 font-mono">Efeitos</span>
+                      <div className="flex-1 grid grid-cols-2 gap-3 text-[10px] text-gray-400">
+                        <label className="flex flex-col gap-1">
+                          Força de cor {colorStrength.toFixed(2)}
+                          <input type="range" min={0} max={1.2} step={0.05} value={colorStrength} onChange={(e)=>setColorStrength(Number(e.target.value))} />
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          Duração de transição {transitionDuration.toFixed(2)}s
+                          <input type="range" min={0.2} max={1.2} step={0.05} value={transitionDuration} onChange={(e)=>setTransitionDuration(Number(e.target.value))} />
+                        </label>
+                      </div>
+                    </div>
                   </div>
 
                 <div className="pt-4 border-t border-gray-800">

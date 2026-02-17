@@ -3,7 +3,10 @@ from __future__ import annotations
 import sys
 import asyncio
 import uuid
+import logging
+import traceback
 from typing import Any, Dict
+from pydantic import BaseModel
 from fastapi import FastAPI, Query, Response, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -21,6 +24,8 @@ from video_factory.tts_generator import synthesize_to_bytes, synthesize_to_bytes
 from video_factory.config import EDGE_VOICE  # noqa: E402
 from video_factory.render_pipeline import RenderRequest, render_script  # noqa: E402
 from video_factory.cleanup import purge_old_assets  # noqa: E402
+from video_factory.video_renderer import build_effects_preview  # noqa: E402
+from video_factory import config  # noqa: E402
 
 # cache de vozes disponíveis (pt-*)
 VOICE_BY_ID: dict[str, dict[str, Any]] = {}
@@ -41,6 +46,7 @@ app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
 
 # Store of render task statuses (in-memory)
 STATUS: Dict[str, Dict[str, Any]] = {}
+logger = logging.getLogger("video_factory.api")
 
 
 @app.exception_handler(RequestValidationError)
@@ -121,6 +127,41 @@ async def render_video(request: RenderRequest):
         raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
 
 
+class PreviewRequest(BaseModel):
+    format: str = "16:9"
+    transition: str | None = None
+    filter: str | None = None
+    colorStrength: float | None = None
+    animationType: str | None = None
+    captionText: str | None = None
+    duration: float | None = 3.5
+    ffmpegFilters: str | None = None
+    stabilize: bool = False
+    aiEnhance: bool = False
+    engine: str | None = None
+
+
+@app.post("/api/render/preview")
+async def render_preview(body: PreviewRequest):
+    """
+    Gera um MP4 curto (3-5s) para pré-visualizar efeitos sem rodar pipeline completo.
+    """
+    try:
+        path = build_effects_preview(
+            format_ratio=body.format or "16:9",
+            transition=body.transition,
+            color_filter=body.filter,
+            color_strength=body.colorStrength,
+            animation_type=body.animationType,
+            caption_text=body.captionText or "Prévia de efeitos",
+            duration=body.duration or 3.5,
+            ffmpeg_filters=body.ffmpegFilters,
+        )
+        return {"output": str(path), "web_url": _path_to_web(path)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Preview failed: {exc}")
+
+
 # ---------- async render with status tracking ----------
 
 
@@ -128,6 +169,14 @@ def _set_status(task_id: str, **kwargs: Any) -> None:
     STATUS.setdefault(task_id, {})
     STATUS[task_id].update(kwargs)
     STATUS[task_id]["updated_at"] = asyncio.get_event_loop().time()
+
+
+def _write_task_error_log(task_id: str, tb: str, err: str) -> Path:
+    logs_dir = config.ASSETS_DIR / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    path = logs_dir / f"render_{task_id}.log"
+    path.write_text(f"task_id={task_id}\nerror={err}\n\n{tb}", encoding="utf-8")
+    return path
 
 @app.get("/api/ping")
 async def ping():
