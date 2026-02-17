@@ -679,6 +679,70 @@ class VideoBuilder:
 
         return clip.transform(effect, keep_duration=True)
 
+    def _apply_rotate(self, clip: ImageClip, direction: int = 1) -> ImageClip:
+        direction = 1 if direction >= 0 else -1
+        max_angle = 4.0 * ANIMATION_INTENSITY * 10
+
+        def effect(gf, t):
+            frame = gf(t)
+            angle = direction * max_angle * math.sin(2 * math.pi * (t / max(clip.duration or 0.001, 0.001)))
+            from PIL import Image
+
+            pil_img = Image.fromarray(frame)
+            pil_img = pil_img.rotate(angle, resample=Image.BICUBIC, expand=True)
+            x = (pil_img.width - frame.shape[1]) // 2
+            y = (pil_img.height - frame.shape[0]) // 2
+            cropped = pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0]))
+            return np.array(cropped)
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_sway(self, clip: ImageClip) -> ImageClip:
+        def effect(gf, t):
+            frame = gf(t)
+            w = frame.shape[1]
+            shift = int(np.sin(2 * np.pi * (t / max(clip.duration or 0.001, 0.001))) * w * 0.02)
+            return np.roll(frame, shift, axis=1)
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_warp(self, clip: ImageClip, direction: int = 1) -> ImageClip:
+        direction = 1 if direction >= 0 else -1
+        wobble = ANIMATION_INTENSITY * 0.35
+
+        def effect(gf, t):
+            frame = gf(t)
+            phase = 2 * np.pi * (t / max(clip.duration or 0.001, 0.001))
+            scale = 1.0 + wobble * np.sin(phase) * direction
+            angle = 3.0 * wobble * 50 * np.sin(phase * 0.5) * direction
+            from PIL import Image
+
+            pil_img = Image.fromarray(frame)
+            pil_img = pil_img.resize((int(pil_img.width * scale), int(pil_img.height * scale)), Image.LANCZOS)
+            pil_img = pil_img.rotate(angle, resample=Image.BICUBIC, expand=True)
+            x = (pil_img.width - frame.shape[1]) // 2
+            y = (pil_img.height - frame.shape[0]) // 2
+            cropped = pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0]))
+            return np.array(cropped)
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_pulse(self, clip: ImageClip) -> ImageClip:
+        def effect(gf, t):
+            frame = gf(t)
+            progress = np.sin(2 * np.pi * (t / max(clip.duration or 0.001, 0.001)))
+            factor = 1.0 + ANIMATION_INTENSITY * 0.3 * progress
+            from PIL import Image
+
+            pil_img = Image.fromarray(frame)
+            new_size = (int(pil_img.width * factor), int(pil_img.height * factor))
+            pil_img = pil_img.resize(new_size, Image.LANCZOS)
+            x = (pil_img.width - frame.shape[1]) // 2
+            y = (pil_img.height - frame.shape[0]) // 2
+            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
+
+        return clip.transform(effect, keep_duration=True)
+
 
 def run_ffmpeg_filtergraph(input_path: Path, filtergraph: str) -> Path | None:
     """
@@ -815,67 +879,3 @@ def build_effects_preview(
         filtered = run_ffmpeg_filtergraph(output, ffmpeg_filters)
         return filtered or output
     return output
-
-    def _apply_rotate(self, clip: ImageClip, direction: int = 1) -> ImageClip:
-        direction = 1 if direction >= 0 else -1
-        max_angle = 4.0 * ANIMATION_INTENSITY * 10
-
-        def effect(gf, t):
-            frame = gf(t)
-            angle = direction * max_angle * math.sin(2 * math.pi * (t / max(clip.duration or 0.001, 0.001)))
-            from PIL import Image
-
-            pil_img = Image.fromarray(frame)
-            pil_img = pil_img.rotate(angle, resample=Image.BICUBIC, expand=True)
-            x = (pil_img.width - frame.shape[1]) // 2
-            y = (pil_img.height - frame.shape[0]) // 2
-            cropped = pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0]))
-            return np.array(cropped)
-
-        return clip.transform(effect, keep_duration=True)
-
-    def _apply_sway(self, clip: ImageClip) -> ImageClip:
-        def effect(gf, t):
-            frame = gf(t)
-            h, w = frame.shape[:2]
-            shift = int(np.sin(2 * np.pi * (t / max(clip.duration or 0.001, 0.001))) * w * 0.02)
-            return np.roll(frame, shift, axis=1)
-
-        return clip.transform(effect, keep_duration=True)
-
-    def _apply_warp(self, clip: ImageClip, direction: int = 1) -> ImageClip:
-        direction = 1 if direction >= 0 else -1
-        wobble = ANIMATION_INTENSITY * 0.35
-
-        def effect(gf, t):
-            frame = gf(t)
-            phase = 2 * np.pi * (t / max(clip.duration or 0.001, 0.001))
-            scale = 1.0 + wobble * np.sin(phase) * direction
-            angle = 3.0 * wobble * 50 * np.sin(phase * 0.5) * direction
-            from PIL import Image
-
-            pil_img = Image.fromarray(frame)
-            pil_img = pil_img.resize((int(pil_img.width * scale), int(pil_img.height * scale)), Image.LANCZOS)
-            pil_img = pil_img.rotate(angle, resample=Image.BICUBIC, expand=True)
-            x = (pil_img.width - frame.shape[1]) // 2
-            y = (pil_img.height - frame.shape[0]) // 2
-            cropped = pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0]))
-            return np.array(cropped)
-
-        return clip.transform(effect, keep_duration=True)
-
-    def _apply_pulse(self, clip: ImageClip) -> ImageClip:
-        def effect(gf, t):
-            frame = gf(t)
-            progress = np.sin(2 * np.pi * (t / max(clip.duration or 0.001, 0.001)))
-            factor = 1.0 + ANIMATION_INTENSITY * 0.3 * progress
-            from PIL import Image
-
-            pil_img = Image.fromarray(frame)
-            new_size = (int(pil_img.width * factor), int(pil_img.height * factor))
-            pil_img = pil_img.resize(new_size, Image.LANCZOS)
-            x = (pil_img.width - frame.shape[1]) // 2
-            y = (pil_img.height - frame.shape[0]) // 2
-            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
-
-        return clip.transform(effect, keep_duration=True)

@@ -38,6 +38,17 @@ interface GridTile {
   dataUrl: string;
 }
 
+interface OpenSections {
+  ollama: boolean;
+  theme: boolean;
+  effects: boolean;
+  audio: boolean;
+  voice: boolean;
+  backend: boolean;
+  grid: boolean;
+  advanced: boolean;
+}
+
 interface SessionPayload {
   topic: string;
   format: '16:9' | '9:16';
@@ -53,9 +64,34 @@ interface SessionPayload {
   gridCols: number;
   gridSceneTarget: string | null;
   edgeVoiceId: string;
+  currentStep?: WorkflowStep;
+  videoUrl?: string | null;
+  ollamaHost?: string;
+  ollamaModel?: string;
+  captionScale?: number;
+  captionBg?: number;
+  captionColor?: string;
+  captionHighlight?: string;
+  captionY?: number;
+  musicVolume?: number;
+  narrationVolume?: number;
+  colorStrength?: number;
+  transitionDuration?: number;
+  previewText?: string;
+  previewTransition?: string;
+  previewFilter?: string;
+  previewAnimation?: string;
+  previewColorStrength?: number;
+  previewFilters?: string;
+  previewUrl?: string | null;
+  cleanupAgeDays?: number;
+  canvasZoom?: number;
+  openSections?: Partial<OpenSections>;
+  gridFile?: string | null;
 }
 
 const SESSION_KEY = 'vv_session';
+const SESSION_PREV_KEY = 'vv_session_prev';
 
 const App: React.FC = () => {
   const [topic, setTopic] = useState('');
@@ -155,7 +191,7 @@ const App: React.FC = () => {
   ];
   const edgeVoiceOptions = edgeVoices.length ? edgeVoices : staticEdgeVoices;
   const selectedEdgeVoice = edgeVoiceOptions.find(v => v.id === edgeVoiceId) || edgeVoiceOptions[0];
-  const [openSections, setOpenSections] = useState({
+  const [openSections, setOpenSections] = useState<OpenSections>({
     ollama: true,
     theme: true,
     effects: true,
@@ -193,6 +229,8 @@ const App: React.FC = () => {
   const [gridProcessing, setGridProcessing] = useState(false);
   const [gridError, setGridError] = useState<string | null>(null);
   const [gridSceneTarget, setGridSceneTarget] = useState<string | null>(null);
+  const [isSessionReady, setIsSessionReady] = useState(false);
+  const sessionBootRef = useRef(false);
 
   // resolve API base (auto fallback, scans common ports)
   useEffect(() => {
@@ -322,14 +360,38 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     setFormat(payload.format ?? '16:9');
     setVideoLength(payload.videoLength ?? '1m');
     setSettings(prev => payload.settings ? { ...prev, ...payload.settings } : prev);
+    if (payload.currentStep && stepOrder.includes(payload.currentStep)) setCurrentStep(payload.currentStep);
     if (payload.ffmpegFilters !== undefined) setFfmpegFilters(payload.ffmpegFilters);
     if (payload.stabilize !== undefined) setStabilize(payload.stabilize);
     if (payload.aiEnhance !== undefined) setAiEnhance(payload.aiEnhance);
     if (payload.engine) setEngine(payload.engine);
+    if (payload.ollamaHost) setOllamaHost(payload.ollamaHost);
+    if (payload.ollamaModel) setOllamaModel(payload.ollamaModel);
+    if (payload.videoUrl !== undefined) setVideoUrl(payload.videoUrl || null);
+    if (payload.captionScale !== undefined) setCaptionScale(Math.max(0.6, Math.min(1.6, Number(payload.captionScale) || 1)));
+    if (payload.captionBg !== undefined) setCaptionBg(Math.max(0, Math.min(1, Number(payload.captionBg) || 0.55)));
+    if (payload.captionColor) setCaptionColor(payload.captionColor);
+    if (payload.captionHighlight) setCaptionHighlight(payload.captionHighlight);
+    if (payload.captionY !== undefined) setCaptionY(Math.max(50, Math.min(95, Number(payload.captionY) || 82)));
+    if (payload.musicVolume !== undefined) setMusicVolume(Math.max(0, Number(payload.musicVolume) || 0));
+    if (payload.narrationVolume !== undefined) setNarrationVolume(Math.max(0, Number(payload.narrationVolume) || 0));
+    if (payload.colorStrength !== undefined) setColorStrength(Math.max(0, Number(payload.colorStrength) || 0));
+    if (payload.transitionDuration !== undefined) setTransitionDuration(Math.max(0.05, Number(payload.transitionDuration) || 0.6));
+    if (payload.previewText !== undefined) setPreviewText(payload.previewText || '');
+    if (payload.previewTransition) setPreviewTransition(payload.previewTransition);
+    if (payload.previewFilter) setPreviewFilter(payload.previewFilter);
+    if (payload.previewAnimation) setPreviewAnimation(payload.previewAnimation);
+    if (payload.previewColorStrength !== undefined) setPreviewColorStrength(Math.max(0, Number(payload.previewColorStrength) || 0));
+    if (payload.previewFilters !== undefined) setPreviewFilters(payload.previewFilters || '');
+    if (payload.previewUrl !== undefined) setPreviewUrl(payload.previewUrl || null);
+    if (payload.cleanupAgeDays !== undefined) setCleanupAgeDays(Math.max(1, Math.floor(Number(payload.cleanupAgeDays) || 7)));
+    if (payload.canvasZoom !== undefined) setCanvasZoom(clampZoom(Number(payload.canvasZoom) || 0.9));
+    if (payload.openSections) setOpenSections(prev => ({ ...prev, ...payload.openSections }));
     setScenePositions(payload.scenePositions || {});
     setGridRows(payload.gridRows || 2);
     setGridCols(payload.gridCols || 3);
     setGridSceneTarget(payload.gridSceneTarget || null);
+    if (payload.gridFile !== undefined) setGridFile(payload.gridFile || null);
     if (payload.edgeVoiceId) setEdgeVoiceId(payload.edgeVoiceId);
     if (payload.script) {
       const scenesWithStatus = payload.script.scenes.map((s, idx) => ({
@@ -341,12 +403,50 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         flowTo: typeof s.flowTo === 'string' ? String(s.flowTo) : null,
       }));
       setScript({ ...payload.script, scenes: scenesWithStatus });
-      setCurrentStep('assets');
+      if (!payload.currentStep || !stepOrder.includes(payload.currentStep)) {
+        setCurrentStep('assets');
+      }
     } else {
       setScript(null);
-      setCurrentStep('topic');
+      if (!payload.currentStep || !stepOrder.includes(payload.currentStep)) {
+        setCurrentStep('topic');
+      }
     }
     return true;
+  };
+
+  useEffect(() => {
+    if (sessionBootRef.current) return;
+    sessionBootRef.current = true;
+    const stored = localStorage.getItem(SESSION_KEY);
+    if (!stored) {
+      setIsSessionReady(true);
+      return;
+    }
+    try {
+      const payload = JSON.parse(stored) as SessionPayload;
+      if (applySessionPayload(payload)) {
+        pushLog('Sessão restaurada automaticamente', 'info');
+      }
+    } catch (err: any) {
+      pushLog(`Falha ao restaurar sessão automática: ${err?.message || err}`, 'warn');
+    } finally {
+      setIsSessionReady(true);
+    }
+  }, []);
+
+  const persistSessionPayload = (payload: SessionPayload) => {
+    try {
+      const serialized = JSON.stringify(payload);
+      const current = localStorage.getItem(SESSION_KEY);
+      if (current === serialized) return;
+      if (current) {
+        localStorage.setItem(SESSION_PREV_KEY, current);
+      }
+      localStorage.setItem(SESSION_KEY, serialized);
+    } catch {
+      // ignore quota issues
+    }
   };
 
   const canvasBounds = useMemo(() => {
@@ -411,6 +511,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
   }, [sceneIdKey]);
 
   useEffect(() => {
+    if (!isSessionReady) return;
     const payload: SessionPayload = {
       topic,
       format,
@@ -426,13 +527,73 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       gridCols,
       gridSceneTarget,
       edgeVoiceId,
+      currentStep,
+      videoUrl,
+      ollamaHost,
+      ollamaModel,
+      captionScale,
+      captionBg,
+      captionColor,
+      captionHighlight,
+      captionY,
+      musicVolume,
+      narrationVolume,
+      colorStrength,
+      transitionDuration,
+      previewText,
+      previewTransition,
+      previewFilter,
+      previewAnimation,
+      previewColorStrength,
+      previewFilters,
+      previewUrl,
+      cleanupAgeDays,
+      canvasZoom,
+      openSections,
+      gridFile,
     };
-    try {
-      localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
-    } catch {
-      // ignore quota issues
-    }
-  }, [topic, format, videoLength, settings, script, scenePositions, gridRows, gridCols, gridSceneTarget, edgeVoiceId]);
+    persistSessionPayload(payload);
+  }, [
+    isSessionReady,
+    topic,
+    format,
+    videoLength,
+    ffmpegFilters,
+    stabilize,
+    aiEnhance,
+    engine,
+    settings,
+    script,
+    scenePositions,
+    gridRows,
+    gridCols,
+    gridSceneTarget,
+    edgeVoiceId,
+    currentStep,
+    videoUrl,
+    ollamaHost,
+    ollamaModel,
+    captionScale,
+    captionBg,
+    captionColor,
+    captionHighlight,
+    captionY,
+    musicVolume,
+    narrationVolume,
+    colorStrength,
+    transitionDuration,
+    previewText,
+    previewTransition,
+    previewFilter,
+    previewAnimation,
+    previewColorStrength,
+    previewFilters,
+    previewUrl,
+    cleanupAgeDays,
+    canvasZoom,
+    openSections,
+    gridFile,
+  ]);
 
   const handleCanvasWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     // Ctrl+scroll: zoom (trackpad pinch also triggers ctrlKey on many browsers)
@@ -766,16 +927,32 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
   const restoreSession = () => {
     const stored = localStorage.getItem(SESSION_KEY);
     if (!stored) {
-      pushLog('Nenhuma sessão salva', 'warn');
+      pushLog('Nenhuma sessao salva', 'warn');
       return;
     }
     try {
       const payload = JSON.parse(stored) as SessionPayload;
       if (applySessionPayload(payload)) {
-        pushLog('Sessão restaurada', 'info');
+        pushLog('Sessao restaurada', 'info');
       }
     } catch (err: any) {
-      pushLog(`Erro ao restaurar sessão: ${err?.message || err}`, 'error');
+      pushLog(`Erro ao restaurar sessao: ${err?.message || err}`, 'error');
+    }
+  };
+
+  const restorePreviousSession = () => {
+    const stored = localStorage.getItem(SESSION_PREV_KEY);
+    if (!stored) {
+      pushLog('Nenhuma sessao anterior salva', 'warn');
+      return;
+    }
+    try {
+      const payload = JSON.parse(stored) as SessionPayload;
+      if (applySessionPayload(payload)) {
+        pushLog('Sessao anterior restaurada', 'info');
+      }
+    } catch (err: any) {
+      pushLog(`Erro ao restaurar sessao anterior: ${err?.message || err}`, 'error');
     }
   };
 
@@ -1013,6 +1190,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     setStatusMessage('');
     setScenePositions({});
     localStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(SESSION_PREV_KEY);
   };
 
   const generateFullVideo = async () => {
@@ -1192,6 +1370,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
               </div>
               <div className="flex gap-2">
                 <button onClick={restoreSession} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all">Recuperar sessão</button>
+                <button onClick={restorePreviousSession} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-amber-500/40 text-amber-300 hover:text-white hover:border-amber-400 transition-all">Sessão anterior</button>
                 <button onClick={resetProject} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-red-500/40 text-red-300 hover:text-white hover:border-red-400 transition-all">Resetar</button>
               </div>
             </div>
