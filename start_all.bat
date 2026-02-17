@@ -9,7 +9,7 @@ start "ollama-serve" cmd /c "ollama serve"
 timeout /t 2 >nul
 
 echo [2/4] Subindo API de preview (FastAPI/uvicorn)...
-start "velozz-api" cmd /c "cd /d %ROOT%video_factory && %VENV%\uvicorn video_factory.api:app --host 0.0.0.0 --port 8000"
+start "velozz-api" cmd /c "cd /d %ROOT% && %VENV%\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port 8000"
 
 echo [3/4] Subindo frontend Vite (npm run dev)...
 start "velozz-front" cmd /c "cd /d %ROOT% && npm run dev"

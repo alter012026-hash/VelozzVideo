@@ -21,8 +21,8 @@ ollama run llama3   # garante que o modelo esteja carregado
 ```
 cd D:\Projeto_piloto
 video_factory\.venv\Scripts\activate
-cd video_factory
-uvicorn video_factory.api:app --host 0.0.0.0 --port 8000
+# rode sempre a partir da raiz para o pacote ser encontrado
+.\video_factory\.venv\Scripts\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port 8000
 ```
 
 ### 2.3 Frontend Vite
