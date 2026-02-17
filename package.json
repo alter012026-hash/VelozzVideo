@@ -1,0 +1,25 @@
+{
+  "name": "",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "backend:check": "powershell -File video_factory/check_services.ps1",
+    "backend:render": "cd video_factory && .venv/Scripts/python pipeline.py --topic \"Demo video\" --aspect 16:9",
+    "backend:api": "cd video_factory && ..\\.venv\\Scripts\\uvicorn video_factory.api:app --host 0.0.0.0 --port 8000"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "@google/genai": "^1.41.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}

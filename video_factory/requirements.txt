@@ -1,0 +1,15 @@
+requests
+python-dotenv
+moviepy
+pillow
+numpy
+pandas
+pydub
+soundfile
+ollama
+tqdm
+beautifulsoup4
+edge-tts
+pocket-tts
+fastapi
+uvicorn
