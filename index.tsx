@@ -1,16 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Modality } from "@google/genai";
-
-declare global {
-  interface Window {
-    aistudio?: {
-      hasSelectedApiKey: () => Promise<boolean>;
-      openSelectKey: () => Promise<void>;
-      getSelectedApiKey?: () => Promise<string>;
-    };
-  }
-}
 
 // --- Types ---
 interface Scene {
@@ -18,8 +7,11 @@ interface Scene {
   text: string;
   visualPrompt: string;
   localImage?: string;
-  narrationAudio?: string; // Base64 PCM data
+  narrationAudio?: string; // Data URL MP3 (preview)
   status: 'pending' | 'processing' | 'completed';
+  transition?: string;
+  filter?: string;
+  flowTo?: string | null;
 }
 
 interface GeneralSettings {
@@ -28,6 +20,8 @@ interface GeneralSettings {
   backgroundMusic: string;
   localBackgroundMusic?: string; // Áudio local de fundo
   voiceName: string;
+  defaultTransition?: string;
+  defaultFilter?: string;
 }
 
 interface Script {
@@ -35,7 +29,6 @@ interface Script {
   scenes: Scene[];
 }
 
-type ScriptSource = 'gemini' | 'ollama';
 type WorkflowStep = 'topic' | 'scripting' | 'assets' | 'rendering' | 'done';
 
 interface GridTile {
@@ -62,18 +55,39 @@ const SESSION_KEY = 'vv_session';
 
 const App: React.FC = () => {
   const [topic, setTopic] = useState('');
-  const [scriptSource, setScriptSource] = useState<ScriptSource>('ollama'); // prioriza local
   const [videoLength, setVideoLength] = useState<'1m' | '5m'>('1m');
   const [currentStep, setCurrentStep] = useState<WorkflowStep>('topic');
   const stepOrder: WorkflowStep[] = ['topic', 'scripting', 'assets', 'rendering', 'done'];
+  const transitionOptions = [
+    { id: 'fade', label: 'Fade in/out (padrão)' },
+    { id: 'crossfade', label: 'Crossfade' },
+    { id: 'slide_left', label: 'Slide Left' },
+    { id: 'slide_right', label: 'Slide Right' },
+    { id: 'slide_up', label: 'Slide Up' },
+    { id: 'slide_down', label: 'Slide Down' },
+    { id: 'none', label: 'Sem transição' },
+  ];
+  const filterOptions = [
+    { id: 'none', label: 'Nenhum' },
+    { id: 'cinematic', label: 'Cinematic quente' },
+    { id: 'cool', label: 'Frio / teal' },
+    { id: 'warm', label: 'Quente' },
+    { id: 'bw', label: 'Preto e branco' },
+    { id: 'vibrant', label: 'Vibrante' },
+    { id: 'vhs', label: 'VHS grão leve' },
+    { id: 'matte', label: 'Matte suave' },
+  ];
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
   const [script, setScript] = useState<Script | null>(null);
   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+  const [isTestingRender, setIsTestingRender] = useState(false);
   const [isGeneratingNarration, setIsGeneratingNarration] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
+  const [renderTaskId, setRenderTaskId] = useState<string | null>(null);
+  const [renderProgress, setRenderProgress] = useState<number>(0);
+  const [renderStage, setRenderStage] = useState<string>('');
   const [format, setFormat] = useState<'16:9' | '9:16'>('16:9');
-  const [hasApiKey, setHasApiKey] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
   const [ollamaModel, setOllamaModel] = useState('llama3');
@@ -85,6 +99,7 @@ const App: React.FC = () => {
   const [previewText, setPreviewText] = useState('Esta e uma previa de voz.');
   const [edgeVoiceId, setEdgeVoiceId] = useState('pt-BR-ThalitaMultilingualNeural');
   const [edgeVoices, setEdgeVoices] = useState<{ id: string; label: string; gender: string; locale: string }[]>([]);
+  const [livePreview, setLivePreview] = useState<{ sceneId: string; label: string } | null>(null);
   const staticEdgeVoices = [
     { id: 'pt-BR-ThalitaMultilingualNeural', label: 'ThalitaMultilingualNeural', gender: 'Female', locale: 'pt-BR' },
     { id: 'pt-BR-FranciscaNeural', label: 'FranciscaNeural', gender: 'Female', locale: 'pt-BR' },
@@ -97,9 +112,9 @@ const App: React.FC = () => {
   const [openSections, setOpenSections] = useState({
     ollama: true,
     theme: true,
+    effects: true,
     audio: true,
     voice: true,
-    api: true,
     backend: true,
     grid: true,
   });
@@ -167,7 +182,9 @@ const App: React.FC = () => {
   const [settings, setSettings] = useState<GeneralSettings>({
     theme: 'Cinematographic',
     backgroundMusic: 'Áudio Local',
-    voiceName: 'Kore'
+    voiceName: 'Kore',
+    defaultTransition: 'fade',
+    defaultFilter: 'cinematic',
   });
 
   const sceneIdKey = script ? script.scenes.map(s => s.id).join('|') : '';
@@ -184,7 +201,13 @@ const App: React.FC = () => {
     setGridSceneTarget(payload.gridSceneTarget || null);
     if (payload.edgeVoiceId) setEdgeVoiceId(payload.edgeVoiceId);
     if (payload.script) {
-      const scenesWithStatus = payload.script.scenes.map(s => ({ ...s, status: s.status ?? 'completed' }));
+      const scenesWithStatus = payload.script.scenes.map(s => ({
+        ...s,
+        status: s.status ?? 'completed',
+        transition: s.transition || payload.settings?.defaultTransition || settings.defaultTransition || 'fade',
+        filter: s.filter || payload.settings?.defaultFilter || settings.defaultFilter || 'none',
+        flowTo: typeof s.flowTo === 'string' ? s.flowTo : null,
+      }));
       setScript({ ...payload.script, scenes: scenesWithStatus });
       setCurrentStep('assets');
     } else {
@@ -211,6 +234,12 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem('vv_canvas_zoom', String(canvasZoom));
   }, [canvasZoom]);
+
+  useEffect(() => {
+    if (!livePreview) return;
+    const t = setTimeout(() => setLivePreview(null), 1200);
+    return () => clearTimeout(t);
+  }, [livePreview]);
 
   useEffect(() => {
     if (!script) {
@@ -315,6 +344,9 @@ const App: React.FC = () => {
       text: 'Nova narração',
       visualPrompt: 'Nova descrição',
       status: 'completed',
+      transition: settings.defaultTransition,
+      filter: settings.defaultFilter,
+      flowTo: null,
     };
     setScript({ ...script, scenes: [...script.scenes, newScene] });
 
@@ -331,13 +363,6 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    const checkKey = async () => {
-      // @ts-ignore
-      const hasKey = await window.aistudio.hasSelectedApiKey();
-      setHasApiKey(hasKey);
-    };
-    checkKey();
-
     // carrega preferências locais de roteiro
     const storedHost = localStorage.getItem('ollama_host');
     const storedModel = localStorage.getItem('ollama_model');
@@ -524,22 +549,11 @@ const App: React.FC = () => {
     }
   };
 
-  const handleAiError = async (error: any, context: string) => {
+  const handleAiError = (error: any, context: string) => {
     console.error(`${context} failed:`, error);
-    const errorMessage = String(error?.message || error || '');
-    if (errorMessage.includes("API key expired") || errorMessage.includes("429") || errorMessage.includes("400")) {
-      // @ts-ignore
-      await window.aistudio.openSelectKey();
-      setHasApiKey(true);
-    } else {
-      alert(`${context} falhou: ${errorMessage}`);
-    }
-  };
-
-  const handleOpenKeySelector = async () => {
-    // @ts-ignore
-    await window.aistudio.openSelectKey();
-    setHasApiKey(true);
+    const errorMessage = String(error?.message || error || 'Erro desconhecido');
+    pushLog(`${context} falhou: ${errorMessage}`, 'error');
+    setStatusMessage(`${context} falhou: ${errorMessage}`);
   };
 
   const restoreSession = () => {
@@ -570,101 +584,88 @@ const App: React.FC = () => {
     Retorne JSON com "title" e array "scenes" (id, text, visualPrompt). Máximo ${maxScenes} cenas.`;
 
     try {
-      let data;
-      if (scriptSource === 'ollama') {
-        localStorage.setItem('ollama_host', ollamaHost);
-        localStorage.setItem('ollama_model', ollamaModel);
-        const response = await fetch(`${ollamaHost.replace(/\/$/, '')}/api/generate`, {
-          method: 'POST',
-          body: JSON.stringify({ model: ollamaModel, prompt: `${prompt}. Responda apenas com o JSON puro.`, stream: false, format: 'json' }),
-        });
-        const resData = await response.json();
-        data = JSON.parse(String(resData.response));
-      } else {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: prompt,
-          config: { responseMimeType: "application/json" }
-        });
-        data = JSON.parse(String(response.text || '{}'));
-      }
+      localStorage.setItem('ollama_host', ollamaHost);
+      localStorage.setItem('ollama_model', ollamaModel);
+      const response = await fetch(`${ollamaHost.replace(/\/$/, '')}/api/generate`, {
+        method: 'POST',
+        body: JSON.stringify({ model: ollamaModel, prompt: `${prompt}. Responda apenas com o JSON puro.`, stream: false, format: 'json' }),
+      });
+      const resData = await response.json();
+      const data = JSON.parse(String(resData.response));
       
-      const scenesWithStatus = data.scenes.map((s: any) => ({ ...s, status: 'completed' }));
+      const scenesWithStatus = data.scenes.map((s: any) => ({
+        ...s,
+        status: 'completed',
+        transition: settings.defaultTransition,
+        filter: settings.defaultFilter,
+        flowTo: null,
+      }));
       setScript({ ...data, scenes: scenesWithStatus });
       setCurrentStep('assets');
       pushLog(`Roteiro pronto (${data.scenes.length} cenas)`, 'info');
     } catch (error: any) {
       setCurrentStep('topic');
-      await handleAiError(error, 'Roteiro');
-      pushLog(`Erro no roteiro: ${error?.message || error}`, 'error');
+      handleAiError(error, 'Roteiro');
     } finally {
       setIsGeneratingScript(false);
       setStatusMessage('');
     }
   };
 
+  const blobToDataUrl = (blob: Blob): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result === 'string') {
+          resolve(reader.result);
+        } else {
+          reject(new Error('Falha ao converter áudio'));
+        }
+      };
+      reader.onerror = () => reject(new Error('Falha ao ler áudio'));
+      reader.readAsDataURL(blob);
+    });
+
   const generateNarration = async (sceneId: string, text: string) => {
     setIsGeneratingNarration(sceneId);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `Say clearly: ${text}` }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: settings.voiceName },
-            },
-          },
-        },
-      });
-
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        updateScene(sceneId, { narrationAudio: base64Audio });
-        pushLog(`Narração gerada para cena ${sceneId}`, 'info');
+      const res = await fetch(
+        `/api/tts/preview?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(edgeVoiceId)}`
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.detail || `HTTP ${res.status}`);
       }
+      const blob = await res.blob();
+      const dataUrl = await blobToDataUrl(blob);
+      updateScene(sceneId, { narrationAudio: dataUrl });
+      pushLog(`Narração gerada para cena ${sceneId}`, 'info');
     } catch (error: any) {
-      await handleAiError(error, 'Narração');
-      pushLog(`Erro na narração: ${error?.message || error}`, 'error');
+      handleAiError(error, 'Narração');
     } finally {
       setIsGeneratingNarration(null);
     }
   };
 
-  const playNarration = async (base64: string) => {
-    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-    const bytes = atob(base64);
-    const arrayBuffer = new ArrayBuffer(bytes.length);
-    const uint8View = new Uint8Array(arrayBuffer);
-    for (let i = 0; i < bytes.length; i++) uint8View[i] = bytes.charCodeAt(i);
-    
-    const dataInt16 = new Int16Array(uint8View.buffer);
-    const audioBuffer = audioCtx.createBuffer(1, dataInt16.length, 24000);
-    const channelData = audioBuffer.getChannelData(0);
-    for (let i = 0; i < dataInt16.length; i++) channelData[i] = dataInt16[i] / 32768.0;
-
-    const source = audioCtx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioCtx.destination);
-    source.start();
+  const playNarration = (source: string) => {
+    const audio = new Audio(source);
+    audio.play();
   };
 
   const updateScene = (id: string, updates: Partial<Scene>) => {
-    if (!script) return;
-    setScript({
-      ...script,
-      scenes: script.scenes.map(s => s.id === id ? { ...s, ...updates } : s)
+    setScript(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        scenes: prev.scenes.map(s => (s.id === id ? { ...s, ...updates } : s)),
+      };
     });
   };
 
   const deleteScene = (id: string) => {
-    if (!script) return;
-    setScript({
-      ...script,
-      scenes: script.scenes.filter(s => s.id !== id)
+    setScript(prev => {
+      if (!prev) return prev;
+      return { ...prev, scenes: prev.scenes.filter(s => s.id !== id) };
     });
     setScenePositions(prev => {
       const next = { ...prev };
@@ -674,17 +675,33 @@ const App: React.FC = () => {
   };
 
   const duplicateScene = (scene: Scene) => {
-    if (!script) return;
-    const newScene = { ...scene, id: Math.random().toString(36).substr(2, 9), narrationAudio: undefined };
-    const index = script.scenes.findIndex(s => s.id === scene.id);
-    const newScenes = [...script.scenes];
-    newScenes.splice(index + 1, 0, newScene);
-    setScript({ ...script, scenes: newScenes });
+    const newScene = { ...scene, id: Math.random().toString(36).substr(2, 9), narrationAudio: undefined, flowTo: null };
+    setScript(prev => {
+      if (!prev) return prev;
+      const newScenes = [...prev.scenes];
+      const index = newScenes.findIndex(s => s.id === scene.id);
+      newScenes.splice(index + 1, 0, newScene);
+      return { ...prev, scenes: newScenes };
+    });
     setScenePositions(prev => {
       const base = prev[scene.id] || { x: CANVAS_PAD, y: CANVAS_PAD };
       return {
         ...prev,
         [newScene.id]: { x: base.x + 24, y: base.y + 24 },
+      };
+    });
+  };
+
+  const applyEffectsToAllScenes = () => {
+    setScript(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        scenes: prev.scenes.map(s => ({
+          ...s,
+          transition: settings.defaultTransition,
+          filter: settings.defaultFilter,
+        })),
       };
     });
   };
@@ -733,20 +750,13 @@ const App: React.FC = () => {
     }
   };
 
-  const applyTileToScene = async (tile: GridTile) => {
+  const applyTileToScene = (tile: GridTile) => {
     if (!gridSceneTarget) {
       pushLog('Selecione uma cena antes de aplicar o tile', 'warn');
       return;
     }
-    try {
-      const res = await fetch(tile.dataUrl);
-      const blob = await res.blob();
-      const file = new File([blob], `tile-${tile.row}-${tile.col}.png`, { type: blob.type });
-      handleFileUpload('scene_image', gridSceneTarget, file);
-      pushLog(`Tile ${tile.row + 1}x${tile.col + 1} aplicado na cena`, 'info');
-    } catch (err: any) {
-      pushLog(`Erro ao aplicar tile: ${err?.message || err}`, 'error');
-    }
+    updateScene(gridSceneTarget, { localImage: tile.dataUrl });
+    pushLog(`Tile ${tile.row + 1}x${tile.col + 1} aplicado na cena`, 'info');
   };
 
   const handleImportScript = (file: File) => {
@@ -755,7 +765,13 @@ const App: React.FC = () => {
       try {
         const json = JSON.parse(String(reader.result || '{}'));
         if (!json?.title || !Array.isArray(json?.scenes)) throw new Error('Formato inválido');
-        const scenesWithStatus = json.scenes.map((s: any) => ({ ...s, status: s.status ?? 'completed' }));
+        const scenesWithStatus = json.scenes.map((s: any) => ({
+          ...s,
+          status: s.status ?? 'completed',
+          transition: s.transition || settings.defaultTransition,
+          filter: s.filter || settings.defaultFilter,
+          flowTo: typeof s.flowTo === 'string' ? s.flowTo : null,
+        }));
         setScript({ ...json, scenes: scenesWithStatus });
         setCurrentStep('assets');
         setImportError(null);
@@ -789,80 +805,113 @@ const App: React.FC = () => {
 
   const generateFullVideo = async () => {
     if (!script) return;
-    // Só exige chave se for usar geração em nuvem
-    if (scriptSource === 'gemini') {
-      // @ts-ignore
-      if (!(await window.aistudio.hasSelectedApiKey())) {
-        await handleOpenKeySelector();
-        return;
-      }
-    }
 
     setIsGeneratingVideo(true);
     setCurrentStep('rendering');
-    setStatusMessage(`Motor de Edição Híbrido: Processando Assets Locais e Sincronizando Camadas...`);
+    setRenderProgress(0);
+    setRenderStage('Iniciando');
+    setStatusMessage('Iniciando render com motor local...');
 
     try {
       const hasLocalAssets = script.scenes.some(s => s.localImage) || settings.localThemeRef || settings.localBackgroundMusic;
-      
-      if (hasLocalAssets) {
-        setStatusMessage('Motor de Edição: Compilando Projeto com Assets Locais via MoviePy...');
-        await new Promise(r => setTimeout(r, 6000));
-        alert("Sucesso! O Motor de Edição Local processou a trilha sonora e os frames de cena com sucesso. Renderização completa.");
-        setIsGeneratingVideo(false);
-        setCurrentStep('done');
+
+      if (!hasLocalAssets) {
+        setStatusMessage('Adicione imagens ou áudio local antes de processar. O motor local precisa de assets locais para criar o vídeo.');
+        pushLog('Render abortado: faltam assets locais.', 'warn');
+        setCurrentStep('assets');
         return;
       }
 
-      if (scriptSource === 'gemini') {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const fullPrompt = `Video Title: ${script.title}. Visual Theme: ${settings.theme}. Background Music: ${settings.backgroundMusic}. Scene Sequence: ${script.scenes.map(s => s.visualPrompt).join('. ')}. Style: Cinematographic.`;
-        
-        let operation = await ai.models.generateVideos({
-          model: 'veo-3.1-fast-generate-preview',
-          prompt: fullPrompt,
-          config: { numberOfVideos: 1, resolution: '720p', aspectRatio: format }
-        });
+      const payload = {
+        scenes: script.scenes.map(s => ({
+          id: s.id,
+          text: s.text,
+          visualPrompt: s.visualPrompt,
+          localImage: s.localImage,
+          animationType: (s as any).animationType,
+          transition: s.transition || settings.defaultTransition,
+          filter: s.filter || settings.defaultFilter,
+          flowTo: s.flowTo || null,
+        })),
+        format,
+        voice: edgeVoiceId,
+        scriptTitle: script.title,
+      };
 
-        while (!operation.done) {
-          await new Promise(resolve => setTimeout(resolve, 8000));
-          operation = await ai.operations.getVideosOperation({ operation: operation });
-        }
+      const startRes = await fetch('/api/render/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!startRes.ok) throw new Error(`Falha ao iniciar render: HTTP ${startRes.status}`);
+      const { task_id } = await startRes.json();
+      setRenderTaskId(task_id);
+      setStatusMessage('Render em andamento...');
+      pushLog(`Render iniciado (task ${task_id.slice(0, 6)}...)`, 'info');
 
-        if (operation.error) throw new Error(String(operation.error.message));
-
-        const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
-        if (downloadLink) {
-          const res = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
-          const blob = await res.blob();
-          setVideoUrl(URL.createObjectURL(blob));
+      let done = false;
+      while (!done) {
+        const stRes = await fetch(`/api/render/status/${task_id}`);
+        if (!stRes.ok) throw new Error(`Falha ao consultar status: HTTP ${stRes.status}`);
+        const st = await stRes.json();
+        setRenderStage(st.stage || '');
+        setRenderProgress(Math.round((st.progress || 0) * 100));
+        setStatusMessage(st.message || '');
+        if (st.done) {
+          done = true;
+          if (st.error) throw new Error(st.error);
+          setVideoUrl(st.output || null);
+          pushLog(`Render concluído: ${st.output}`, 'info');
           setCurrentStep('done');
-          pushLog('Renderização em nuvem concluída', 'info');
+        } else {
+          await new Promise(r => setTimeout(r, 1500));
         }
       }
     } catch (error: any) {
       setCurrentStep('assets');
-      await handleAiError(error, 'Vídeo');
-      pushLog(`Erro na renderização: ${error?.message || error}`, 'error');
+      handleAiError(error, 'Vídeo');
     } finally {
       setIsGeneratingVideo(false);
       setStatusMessage('');
+      setRenderStage('');
+      setRenderTaskId(null);
+      setRenderProgress(0);
     }
   };
 
-  const needsApiGate = scriptSource === 'gemini' && !hasApiKey;
-
-  if (needsApiGate) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-[#030712] text-white">
-        <div className="glass p-10 rounded-3xl text-center max-w-md shadow-2xl border-white/5">
-          <h1 className="text-3xl font-bold mb-6 gradient-text">VelozzVideo Pro</h1>
-          <p className="text-gray-400 mb-8">Conecte sua chave para ativar o Motor de Edição Híbrido.</p>
-          <button onClick={handleOpenKeySelector} className="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-2xl font-bold transition-all shadow-lg shadow-blue-900/40 uppercase tracking-widest">Ativar Estúdio</button>
-        </div>
-      </div>
-    );
-  }
+  const testRenderPipeline = async () => {
+    if (isGeneratingVideo || isTestingRender) return;
+    setIsTestingRender(true);
+    setStatusMessage('Testando pipeline local com payload padrão...');
+    try {
+      const testRequest = {
+        scenes: [
+          { id: 'test-1', text: 'Cena de teste automática gerada no backend.', animationType: 'kenburns', transition: settings.defaultTransition, filter: settings.defaultFilter },
+          { id: 'test-2', text: 'Segunda cena para validar legendas karaokê.', animationType: 'zoom_in', transition: settings.defaultTransition, filter: settings.defaultFilter },
+        ],
+        format,
+        voice: edgeVoiceId,
+        scriptTitle: 'Teste local',
+      };
+      const response = await fetch('/api/render', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(testRequest),
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err?.detail || `HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      pushLog(`Teste de render concluído: ${data.output}`, 'info');
+      setStatusMessage(`Teste completo. Saída: ${data.output}`);
+    } catch (error: any) {
+      handleAiError(error, 'Teste de render');
+      setStatusMessage('Falha no teste de render.');
+    } finally {
+      setIsTestingRender(false);
+    }
+  };
 
   const progress = ((stepOrder.indexOf(currentStep) + 1) / stepOrder.length) * 100;
 
@@ -939,13 +988,7 @@ const App: React.FC = () => {
           <div className="glass p-5 rounded-3xl flex flex-col gap-4 border-white/5 relative overflow-hidden group">
             <div className="flex justify-between items-center">
               <label className="text-[10px] font-black text-blue-500 uppercase tracking-widest">Tema Visual</label>
-              <div className="flex items-center gap-2">
-                <label className="cursor-pointer">
-                   <span className="text-[9px] font-bold text-gray-500 hover:text-blue-400 uppercase transition-colors">Local File</span>
-                   <input type="file" className="hidden" accept="image/*" onChange={(e) => e.target.files?.[0] && handleFileUpload('global_theme', '', e.target.files[0])} />
-                </label>
-                <button onClick={() => toggleSection('theme')} className="text-[11px] text-gray-400 hover:text-white">{openSections.theme ? '−' : '+'}</button>
-              </div>
+              <button onClick={() => toggleSection('theme')} className="text-[11px] text-gray-400 hover:text-white">{openSections.theme ? '−' : '+'}</button>
             </div>
             {openSections.theme && (
               <>
@@ -960,11 +1003,63 @@ const App: React.FC = () => {
                   <option value="Anime Aesthetic">Anime Aesthetic</option>
                   <option value="Vibrant 3D Render">Vibrant 3D Render</option>
                 </select>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[10px] text-gray-400 uppercase tracking-widest">Referência local</span>
+                  <label className="cursor-pointer inline-flex items-center gap-2 px-3 py-1 bg-blue-500/10 border border-blue-500/30 rounded-xl text-[9px] font-bold text-blue-200 hover:border-blue-300 hover:text-white transition-all">
+                    Upload
+                    <input type="file" className="hidden" accept="image/*" onChange={(e) => e.target.files?.[0] && handleFileUpload('global_theme', '', e.target.files[0])} />
+                  </label>
+                </div>
                 {settings.localThemeRef && (
                   <div className="h-12 w-full rounded-xl overflow-hidden border border-blue-500/30">
                     <img src={settings.localThemeRef} className="w-full h-full object-cover grayscale group-hover:grayscale-0 transition-all" />
                   </div>
                 )}
+              </>
+            )}
+          </div>
+
+          {/* Efeitos de Vídeo (MoviePy) */}
+          <div className="glass p-5 rounded-3xl flex flex-col gap-3 border-blue-500/10 relative overflow-hidden">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-black uppercase text-cyan-300">Efeitos de Vídeo (MoviePy)</p>
+              <button onClick={() => toggleSection('effects')} className="text-[11px] text-gray-400 hover:text-white">{openSections.effects ? '−' : '+'}</button>
+            </div>
+            {openSections.effects && (
+              <>
+                <label className="text-[10px] text-gray-500 uppercase font-bold">Transição padrão</label>
+                <select
+                  value={settings.defaultTransition || 'fade'}
+                  onChange={(e) => setSettings({ ...settings, defaultTransition: e.target.value })}
+                  className="bg-black/40 text-xs p-3 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-blue-500/50 transition-all"
+                >
+                  {transitionOptions.map(opt => (
+                    <option key={opt.id} value={opt.id}>{opt.label}</option>
+                  ))}
+                </select>
+
+                <label className="text-[10px] text-gray-500 uppercase font-bold">Filtro global</label>
+                <select
+                  value={settings.defaultFilter || 'none'}
+                  onChange={(e) => setSettings({ ...settings, defaultFilter: e.target.value })}
+                  className="bg-black/40 text-xs p-3 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-blue-500/50 transition-all"
+                >
+                  {filterOptions.map(opt => (
+                    <option key={opt.id} value={opt.id}>{opt.label}</option>
+                  ))}
+                </select>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={applyEffectsToAllScenes}
+                    className="flex-1 text-[10px] font-black uppercase px-3 py-2 rounded-xl bg-blue-600/80 hover:bg-blue-500 text-white tracking-[0.18em] transition-all"
+                  >
+                    Aplicar nos cards
+                  </button>
+                  <div className="flex-1 text-[10px] text-gray-400 bg-black/30 border border-gray-800 rounded-xl p-2 leading-relaxed">
+                    Inclui fades, crossfade, slides e filtros cinematográficos, bw, vhs, matte, vibrant.
+                  </div>
+                </div>
               </>
             )}
           </div>
@@ -1054,19 +1149,6 @@ const App: React.FC = () => {
             )}
           </div>
 
-          {/* API + Logs */}
-          <div className="glass p-4 rounded-3xl border-purple-500/15 flex flex-col gap-3">
-            <p className="text-[11px] font-black uppercase text-purple-400">API (Opcional)</p>
-            <div className="flex gap-2">
-              <select value={scriptSource} onChange={(e) => setScriptSource(e.target.value as ScriptSource)} className="bg-gray-900 text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-gray-800 outline-none text-gray-400 hover:text-white transition-colors cursor-pointer flex-1">
-                <option value="ollama">Ollama Local</option>
-                <option value="gemini">Gemini API</option>
-              </select>
-              <button onClick={handleOpenKeySelector} className="bg-purple-600 hover:bg-purple-500 text-white text-[10px] font-black uppercase tracking-[0.15em] px-4 py-2 rounded-xl transition-all">Chave</button>
-            </div>
-            <div className="text-[10px] text-gray-500">Status: <span className={hasApiKey ? "text-green-400" : "text-red-400"}>{hasApiKey ? "Conectada" : "Ausente"}</span></div>
-          </div>
-
           <div className="glass p-5 rounded-3xl border-blue-500/15 flex flex-col gap-3 max-h-64 overflow-hidden">
             <div className="flex justify-between items-center">
               <span className="text-[10px] font-black uppercase tracking-[0.2em] text-blue-400">Painel Backend</span>
@@ -1077,15 +1159,15 @@ const App: React.FC = () => {
             </div>
             {openSections.backend && (
               <>
-                <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-300">
-                  <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full" style={{ background: ollamaError ? '#f87171' : '#34d399' }}></span>
-                    Ollama {ollamaError ? 'Offline' : 'Online'}
+                  <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-300">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full" style={{ background: ollamaError ? '#f87171' : '#34d399' }}></span>
+                      Ollama {ollamaError ? 'Offline' : 'Online'}
+                    </div>
+                    <div>Modelos: {ollamaModels.length || '—'}</div>
+                    <div>Áudio: {settings.localBackgroundMusic ? 'Local carregado' : 'Pendente'}</div>
+                    <div>Voice Preview (Edge): {isPreviewingVoice ? 'Local gerando...' : 'Disponível'}</div>
                   </div>
-                  <div>Modelos: {ollamaModels.length || '—'}</div>
-                  <div>Áudio: {settings.localBackgroundMusic ? 'Local carregado' : 'Pendente'}</div>
-                  <div>API Gemini: {hasApiKey ? 'Conectada' : 'Opcional/ausente'}</div>
-                </div>
                 <div className="border border-blue-500/10 rounded-xl bg-black/30 h-28 overflow-auto custom-scrollbar text-[11px] text-gray-200 font-mono px-3 py-2 space-y-1">
                   {logFeed.length === 0 && <div className="text-gray-500 text-[10px]">Sem logs recentes.</div>}
                   {logFeed.map(log => (
@@ -1177,11 +1259,53 @@ const App: React.FC = () => {
               {script && (
                 <div style={{ width: canvasBounds.w * canvasZoom, height: canvasBounds.h * canvasZoom, position: 'relative' }}>
                   <div style={{ width: canvasBounds.w, height: canvasBounds.h, transform: `scale(${canvasZoom})`, transformOrigin: '0 0', position: 'relative' }}>
+                    <svg width={canvasBounds.w} height={canvasBounds.h} className="absolute inset-0 pointer-events-none">
+                      <defs>
+                        <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+                          <path d="M0,0 L0,6 L6,3 z" fill="#60a5fa" />
+                        </marker>
+                      </defs>
+                      {script.scenes.map(scene => {
+                        if (!scene.flowTo) return null;
+                        const from = scenePositions[scene.id];
+                        const to = scenePositions[scene.flowTo];
+                        if (!from || !to) return null;
+                        const x1 = from.x + CARD_W / 2;
+                        const y1 = from.y + CARD_H / 2;
+                        const x2 = to.x + CARD_W / 2;
+                        const y2 = to.y + CARD_H / 2;
+                        return (
+                          <line
+                            key={`${scene.id}->${scene.flowTo}`}
+                            x1={x1}
+                            y1={y1}
+                            x2={x2}
+                            y2={y2}
+                            stroke="#60a5fa"
+                            strokeWidth={2}
+                            strokeDasharray="4 3"
+                            markerEnd="url(#arrow)"
+                            opacity={0.8}
+                          />
+                        );
+                      })}
+                    </svg>
                     {script.scenes.map((scene, idx) => {
                       const pos = scenePositions[scene.id] || { x: CANVAS_PAD, y: CANVAS_PAD };
+                      const transitionValue = scene.transition || settings.defaultTransition || 'fade';
+                      const filterValue = scene.filter || settings.defaultFilter || 'none';
+                      const transitionLabel = transitionOptions.find(t => t.id === transitionValue)?.label || transitionValue;
+                      const filterLabel = filterOptions.find(f => f.id === filterValue)?.label || filterValue;
+                      const flowTargets = script.scenes.filter(s => s.id !== scene.id);
+                      const inboundCount = script.scenes.filter(s => s.flowTo === scene.id).length;
                       return (
                         <div key={scene.id} className="absolute" style={{ left: pos.x, top: pos.y }}>
-                          <div className={`w-72 glass rounded-2xl overflow-hidden border shadow-xl transition-colors ${scene.localImage ? 'border-green-500/20' : 'border-gray-800'}`}>
+                          <div className={`relative w-72 glass rounded-2xl overflow-hidden border shadow-xl transition-colors ${scene.localImage ? 'border-green-500/20' : 'border-gray-800'}`}>
+                            {livePreview?.sceneId === scene.id && (
+                              <div className="absolute inset-0 z-20 bg-black/70 backdrop-blur-sm text-white text-[11px] font-black uppercase tracking-[0.18em] flex items-center justify-center animate-pulse">
+                                Pré-visualização: {livePreview.label}
+                              </div>
+                            )}
                             <div
                               title="Arraste para mover"
                               className={`flex items-center justify-between px-4 py-2 bg-black/40 border-b border-gray-800 select-none ${draggingSceneId === scene.id ? 'cursor-grabbing' : 'cursor-grab'}`}
@@ -1194,7 +1318,11 @@ const App: React.FC = () => {
                                 <span className="w-5 h-5 rounded-full bg-gray-900 border border-gray-800 flex items-center justify-center text-[9px] font-black text-gray-400">{idx + 1}</span>
                                 <span className="text-[10px] font-black uppercase tracking-widest text-gray-500">Cena</span>
                               </div>
-                              <span className="text-[9px] font-mono text-gray-600">{scene.localImage ? 'IMG' : 'SEM IMG'}</span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[9px] font-mono text-gray-600">{scene.localImage ? 'IMG' : 'SEM IMG'}</span>
+                                <span className="text-[9px] px-2 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-100">{transitionValue}</span>
+                                <span className="text-[9px] px-2 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-100">{filterValue}</span>
+                              </div>
                             </div>
 
                             <div className="h-28 bg-gray-950 relative group/asset border-b border-gray-800">
@@ -1246,6 +1374,64 @@ const App: React.FC = () => {
                                     <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                                   </button>
                                 )}
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-3 border-t border-gray-800/40 pt-3">
+                                <div className="flex flex-col gap-1">
+                                  <label className="text-[10px] uppercase text-gray-500 font-black">Transição</label>
+                                  <select
+                                    value={transitionValue}
+                                    onChange={(e) => updateScene(scene.id, { transition: e.target.value })}
+                                    className="bg-black/40 text-xs p-2 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-blue-500/50 transition-all"
+                                  >
+                                    {transitionOptions.map(opt => (
+                                      <option key={opt.id} value={opt.id}>{opt.label}</option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    onClick={() => setLivePreview({ sceneId: scene.id, label: transitionLabel })}
+                                    className="text-[9px] px-2 py-1 rounded-lg border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 transition-all"
+                                  >
+                                    Pré-visualizar
+                                  </button>
+                                </div>
+                                <div className="flex flex-col gap-1">
+                                  <label className="text-[10px] uppercase text-gray-500 font-black">Filtro</label>
+                                  <select
+                                    value={filterValue}
+                                    onChange={(e) => updateScene(scene.id, { filter: e.target.value })}
+                                    className="bg-black/40 text-xs p-2 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-blue-500/50 transition-all"
+                                  >
+                                    {filterOptions.map(opt => (
+                                      <option key={opt.id} value={opt.id}>{opt.label}</option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    onClick={() => setLivePreview({ sceneId: scene.id, label: filterLabel })}
+                                    className="text-[9px] px-2 py-1 rounded-lg border border-emerald-500/40 text-emerald-200 hover:text-white hover:border-emerald-300 transition-all"
+                                  >
+                                    Pré-visualizar
+                                  </button>
+                                </div>
+                                <div className="col-span-2 flex flex-col gap-1">
+                                  <label className="text-[10px] uppercase text-gray-500 font-black">Fluxo entre cards</label>
+                                  <select
+                                    value={scene.flowTo || ''}
+                                    onChange={(e) => updateScene(scene.id, { flowTo: e.target.value || null })}
+                                    className="bg-black/40 text-xs p-2 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-blue-500/50 transition-all"
+                                  >
+                                    <option value="">Sem ligação</option>
+                                    {flowTargets.map((t) => (
+                                      <option key={t.id} value={t.id}>
+                                        Cena {script.scenes.findIndex(s => s.id === t.id) + 1}: {t.text.slice(0, 40) || '...'}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <div className="flex justify-between text-[10px] text-gray-500">
+                                    <span>Saída: {scene.flowTo ? `→ Cena ${script.scenes.findIndex(s => s.id === scene.flowTo) + 1}` : 'isolado'}</span>
+                                    <span>Entradas recebidas: {inboundCount}</span>
+                                  </div>
+                                </div>
                               </div>
 
                               <div className="flex justify-between gap-2 pt-3 border-t border-gray-800/50">
@@ -1376,7 +1562,16 @@ const App: React.FC = () => {
                   <div className="absolute inset-0 bg-black/90 backdrop-blur-2xl z-[60] flex flex-col items-center justify-center rounded-[2.5rem] p-12 text-center">
                     <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-6"></div>
                     <h2 className="text-3xl font-black mb-4 tracking-tighter uppercase">Processando</h2>
-                    <p className="text-gray-400 font-mono text-xs max-w-sm uppercase tracking-widest opacity-60">{statusMessage}</p>
+                    <p className="text-gray-400 font-mono text-xs max-w-sm uppercase tracking-widest opacity-60 mb-4">{statusMessage}</p>
+                    <div className="w-full max-w-md text-left">
+                      <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 uppercase tracking-widest mb-1">
+                        <span>{renderStage || 'Etapa'}</span>
+                        <span>{renderProgress.toFixed(0)}%</span>
+                      </div>
+                      <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
+                        <div className="h-full bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400" style={{ width: `${renderProgress}%` }}></div>
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -1432,17 +1627,24 @@ const App: React.FC = () => {
                     {importError && <p className="text-xs text-red-400">{importError}</p>}
                   </div>
 
-                  <div className="pt-4 border-t border-gray-800">
-                    <button
-                      onClick={generateFullVideo}
-                      disabled={isGeneratingVideo}
-                      className="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all active:scale-[0.98] shadow-xl shadow-blue-900/30"
-                    >
-                      {isGeneratingVideo ? <Loader /> : "Processar Projeto"}
-                    </button>
-                  </div>
+                <div className="pt-4 border-t border-gray-800">
+                  <button
+                    onClick={generateFullVideo}
+                    disabled={isGeneratingVideo}
+                    className="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all active:scale-[0.98] shadow-xl shadow-blue-900/30"
+                  >
+                    {isGeneratingVideo ? <Loader /> : "Processar Projeto"}
+                  </button>
+                  <button
+                    onClick={testRenderPipeline}
+                    disabled={isGeneratingVideo || isTestingRender}
+                    className="w-full mt-3 border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 px-4 py-3 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all"
+                  >
+                    {isTestingRender ? <Loader /> : "Forçar teste (ver logs)"}
+                  </button>
                 </div>
               </div>
+            </div>
             </div>
           )}
         </main>

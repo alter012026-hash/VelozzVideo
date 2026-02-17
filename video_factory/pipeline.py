@@ -1,90 +1,70 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
-import uuid
 from pathlib import Path
 
-import numpy as np
-from moviepy import AudioFileClip, concatenate_videoclips, ImageClip
-from PIL import Image, ImageDraw, ImageFont
-
+# Garante que o pacote seja encontrado mesmo rodando de dentro de video_factory/
 ROOT = Path(__file__).resolve().parent
-if str(ROOT.parent) not in sys.path:
-    sys.path.append(str(ROOT.parent))
+PARENT = ROOT.parent
+if str(PARENT) not in sys.path:
+    sys.path.insert(0, str(PARENT))
 
-from video_factory import config  # noqa: E402
+from video_factory.render_pipeline import RenderRequest, RenderScene, render_script  # noqa: E402
 from video_factory.script_generator import generate_scenes  # noqa: E402
-from video_factory.tts_generator import synthesize  # noqa: E402
+from video_factory.config import EDGE_VOICE  # noqa: E402
 
 
-def _wrap_text(text: str, width: int = 40) -> str:
-    words = text.split()
-    lines = []
-    line = []
-    for w in words:
-        test = " ".join(line + [w])
-        if len(test) > width:
-            lines.append(" ".join(line))
-            line = [w]
-        else:
-            line = test.split() if isinstance(test, str) else [w]
-    if line:
-        lines.append(" ".join(line))
-    return "\n".join(lines)
-
-
-def render_text_image(text: str, size=(1920, 1080), bg_color=(8, 10, 20), text_color=(255, 255, 255)):
-    img = Image.new("RGB", size, color=bg_color)
-    draw = ImageDraw.Draw(img)
-    wrapped = _wrap_text(text, width=60)
-    try:
-        font = ImageFont.truetype("arial.ttf", 48)
-    except Exception:
-        font = ImageFont.load_default()
-    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center")
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    x = (size[0] - text_w) // 2
-    y = (size[1] - text_h) // 2
-    draw.multiline_text((x, y), wrapped, font=font, fill=text_color, align="center", spacing=6)
-    return np.array(img)
-
-
-def build_video_from_scenes(scenes, aspect: str, voice_prefix: str = "voice") -> Path:
-    w, h = (1080, 1920) if aspect == "9:16" else (1920, 1080)
-    clips = []
-    for idx, scene in enumerate(scenes):
-        audio_path = synthesize(scene["text"], f"{voice_prefix}_{idx+1}.mp3")
-        audio_clip = AudioFileClip(audio_path)
-        frame = render_text_image(scene["text"], size=(w, h))
-        video_clip = ImageClip(frame).with_duration(audio_clip.duration)
-        video_clip = video_clip.with_audio(audio_clip)
-        clips.append(video_clip)
-
-    final = concatenate_videoclips(clips, method="compose").with_fps(config.FPS)
-    out_dir = config.ASSETS_DIR / "video"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    outfile = out_dir / f"auto_render_{uuid.uuid4().hex[:8]}.mp4"
-    final.write_videofile(outfile.as_posix(), codec=config.CODEC, audio_codec=config.AUDIO_CODEC, fps=config.FPS)
-    return outfile
-
-
-def run(topic: str, aspect: str = "16:9") -> Path:
-    roteiro = generate_scenes(topic)
+def _build_request(topic: str, aspect: str, duration: int, scenes: int | None) -> RenderRequest:
+    roteiro = generate_scenes(topic, duration_minutes=duration, format_ratio=aspect, num_scenes_override=scenes)
     scenes = roteiro.get("scenes", [])
     if not scenes:
         raise RuntimeError("Nenhuma cena retornada pelo LLM.")
-    return build_video_from_scenes(scenes, aspect)
+
+    render_scenes = []
+    for idx, scene in enumerate(scenes):
+        vp = scene.get("visualPrompt")
+        if isinstance(vp, list):
+            vp = " ".join(str(x) for x in vp)
+        if vp is None:
+            vp = ""
+        txt = scene.get("text") or vp or topic
+        render_scenes.append(
+            RenderScene(
+                id=str(scene.get("id", idx + 1)),
+                text=str(txt),
+                visualPrompt=str(vp),
+                localImage=scene.get("localImage"),
+                animationType=scene.get("animationType"),
+            )
+        )
+
+    return RenderRequest(
+        scenes=render_scenes,
+        format=aspect,
+        voice=EDGE_VOICE,
+        scriptTitle=roteiro.get("title") or topic,
+    )
+
+
+def run(topic: str, aspect: str = "16:9", duration: int = 1, scenes: int | None = None) -> Path:
+    request = _build_request(topic, aspect, duration, scenes)
+    return asyncio.run(render_script(request))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Automatiza vídeo: roteiro (Ollama) -> TTS (Edge) -> MP4.")
+    parser = argparse.ArgumentParser(description="Renderiza vídeo com MoviePy + Edge TTS.")
     parser.add_argument("--topic", required=True, help="Tema do vídeo")
     parser.add_argument("--aspect", choices=["16:9", "9:16"], default="16:9")
+    parser.add_argument("--duration", type=int, choices=[1, 5], default=1, help="Duração em minutos")
+    parser.add_argument("--scenes", type=int, default=None, help="Forçar número de cenas (sobrescreve padrão)")
+    parser.add_argument("--fast", action="store_true", help="Atalho: força poucas cenas (5) e duração 1min")
     args = parser.parse_args()
-    outfile = run(args.topic, args.aspect)
+    duration = 1 if args.fast else args.duration
+    scenes = 5 if args.fast else args.scenes
+    outfile = run(args.topic, args.aspect, duration, scenes)
     print(json.dumps({"output": str(outfile)}, ensure_ascii=False, indent=2))
 
 

@@ -6,18 +6,22 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = ROOT_DIR / "assets"
 CACHE_DIR = ASSETS_DIR / "cache"
+CAPTIONS_DIR = ASSETS_DIR / "captions"
 
 # Carrega variáveis do .env na raiz do projeto
 load_dotenv(dotenv_path=ROOT_DIR.parent / ".env.local")
 load_dotenv(dotenv_path=ROOT_DIR.parent / ".env", override=True)
 
+
 def env(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
+
 
 # LLM / texto
 OLLAMA_HOST = env("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -29,10 +33,26 @@ LLM_API_BASE = env("LLM_API_BASE")  # Ex.: https://api.openai.com/v1
 # Imagens (não usados sem SD, mantidos para futura expansão)
 IMAGE_API_KEY = env("IMAGE_API_KEY")
 
+# Roteiro / narração
+WORDS_PER_MINUTE = int(env("WORDS_PER_MINUTE", "170"))
+SCENE_COUNTS = {1: int(env("SCENES_PER_MIN_1", "10")), 5: int(env("SCENES_PER_MIN_5", "16"))}
+SCRIPT_CHUNK_ENABLED = env("SCRIPT_CHUNK_ENABLED", "0").lower() in {"1", "true", "yes"}
+SCRIPT_CHUNK_SCENES = int(env("SCRIPT_CHUNK_SCENES", "4"))
+SCRIPT_CHUNK_CONTEXT_SCENES = int(env("SCRIPT_CHUNK_CONTEXT_SCENES", "2"))
+SCRIPT_CHUNK_ALLOW_SHORTAGE = env("SCRIPT_CHUNK_ALLOW_SHORTAGE", "1").lower() in {"1", "true", "yes"}
+SCRIPT_EXPAND_ENABLED = env("SCRIPT_EXPAND_ENABLED", "1").lower() in {"1", "true", "yes"}
+SCRIPT_EXPAND_MAX_PASSES = int(env("SCRIPT_EXPAND_MAX_PASSES", "2"))
+SCRIPT_EXPAND_SCENES_PER_PASS = int(env("SCRIPT_EXPAND_SCENES_PER_PASS", "4"))
+SCRIPT_EXPAND_MIN_ADD_WORDS = int(env("SCRIPT_EXPAND_MIN_ADD_WORDS", "20"))
+SCRIPT_EXPAND_MAX_ADD_WORDS = int(env("SCRIPT_EXPAND_MAX_ADD_WORDS", "80"))
+NARRATION_POLISH_ENABLED = env("NARRATION_POLISH_ENABLED", "1").lower() not in {"0", "false", "no"}
+NARRATION_POLISH_MAX_WORDS = int(env("NARRATION_POLISH_MAX_WORDS", "26"))
+
 # Áudio / TTS
 EDGE_VOICE = env("EDGE_VOICE", "pt-BR-ThalitaMultilingualNeural")
 ELEVEN_API_KEY = env("ELEVEN_API_KEY")
 SPEECHIFY_API_KEY = env("SPEECHIFY_API_KEY")
+TTS_PROVIDER = env("TTS_PROVIDER", "edge,offline")  # ordem de tentativa: ex. "edge,offline"
 
 # Vídeo / render
 FPS = int(env("VIDEO_FPS", "30"))
@@ -40,11 +60,44 @@ CODEC = env("VIDEO_CODEC", "libx264")
 AUDIO_CODEC = env("AUDIO_CODEC", "aac")
 ASPECT = env("VIDEO_ASPECT", "16:9")  # 16:9 ou 9:16
 
+# formatos suportados
+VIDEO_FORMATS = {
+    "16:9": {"width": 1920, "height": 1080},
+    "9:16": {"width": 1080, "height": 1920},
+}
+VIDEO_FPS = FPS
+VIDEO_CODEC = CODEC
+VIDEO_AUDIO_CODEC = AUDIO_CODEC
+
+ANIMATION_INTENSITY = float(env("ANIMATION_INTENSITY", "0.35"))
+FADE_DURATION = float(env("FADE_DURATION", "0.6"))
+ANIMATION_TYPES = [
+    item.strip()
+    for item in env(
+        "ANIMATION_TYPES",
+        "kenburns,zoom_in,zoom_out,zoom_in_fast,zoom_out_fast,pan_left,pan_right,pan_up,pan_down,rotate_left,rotate_right,sway,pulse,warp_in,warp_out",
+    ).split(",")
+    if item.strip()
+]
+ANIMATION_STYLE = env("ANIMATION_STYLE", "mixed")
+TRANSITION_STYLE = env("TRANSITION_STYLE", "mixed")
+TRANSITION_TYPES = [item.strip() for item in env("TRANSITION_TYPES", "fade,crossfade,slide_left,slide_right,slide_up,slide_down").split(",") if item.strip()]
+TRANSITION_DURATION = float(env("TRANSITION_DURATION", "0.6"))
+
 # Cache
 CACHE_MAX_AGE_DAYS = int(env("CACHE_MAX_AGE_DAYS", "7"))
 
+
 def ensure_dirs() -> None:
-    for path in [ASSETS_DIR, CACHE_DIR, ASSETS_DIR / "images", ASSETS_DIR / "audio", ASSETS_DIR / "video"]:
+    for path in [
+        ASSETS_DIR,
+        CACHE_DIR,
+        ASSETS_DIR / "images",
+        ASSETS_DIR / "audio",
+        ASSETS_DIR / "video",
+        CAPTIONS_DIR,
+    ]:
         path.mkdir(parents=True, exist_ok=True)
+
 
 ensure_dirs()

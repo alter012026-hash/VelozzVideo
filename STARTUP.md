@@ -22,7 +22,7 @@ ollama run llama3   # garante que o modelo esteja carregado
 cd D:\Projeto_piloto
 video_factory\.venv\Scripts\activate
 # rode sempre a partir da raiz para o pacote ser encontrado
-.\video_factory\.venv\Scripts\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port 8000
+.\video_factory\.venv\Scripts\python -m uvicorn video_factory.api:app --host 0.0.0.0 --port %API_PORT%
 ```
 
 ### 2.3 Frontend Vite
@@ -42,11 +42,13 @@ python pipeline.py --topic "Seu tema" --aspect 16:9
 ## 3) Atalho em um comando (já existe)
 - Arquivo: `start_all.bat` (na raiz). Ele abre janelas para:
   - `ollama serve`
-  - API FastAPI (porta 8000)
+  - API FastAPI (porta %API_PORT% (din�mica))
   - Frontend Vite (porta 3000)
   - Pipeline demo (pode fechar se não quiser)
 
 ## Observações
-- Proxy do front: `/ollama` → `http://127.0.0.1:11434`, `/api` → `http://127.0.0.1:8000`.
+- Proxy do front: `/ollama` -> `http://127.0.0.1:11434`, `/api` -> `http://127.0.0.1:%API_PORT%`.
 - Ajuste o texto de prévia de voz na sidebar; clique “Ouvir prévia” para testar o TTS.
 - Saídas de vídeo/áudio ficam em `video_factory/assets/`.
+
+

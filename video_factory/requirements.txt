@@ -11,5 +11,6 @@ tqdm
 beautifulsoup4
 edge-tts
 pocket-tts
+pyttsx3
 fastapi
 uvicorn

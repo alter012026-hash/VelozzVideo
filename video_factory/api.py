@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
+import asyncio
+import uuid
+from typing import Any, Dict
 from fastapi import FastAPI, Query, Response, HTTPException
 import edge_tts
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,7 @@ if str(ROOT.parent) not in sys.path:
 
 from video_factory.tts_generator import synthesize_to_bytes  # noqa: E402
 from video_factory.config import EDGE_VOICE  # noqa: E402
+from video_factory.render_pipeline import RenderRequest, render_script  # noqa: E402
 
 # cache de vozes disponíveis (pt-*)
 VOICE_BY_ID: dict[str, dict[str, Any]] = {}
@@ -28,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Store of render task statuses (in-memory)
+STATUS: Dict[str, Dict[str, Any]] = {}
 
 
 @app.on_event("startup")
@@ -103,3 +109,49 @@ async def tts_preview(text: str = Query(..., min_length=1, max_length=300), voic
         return Response(content=audio_bytes, media_type="audio/mpeg", headers={"X-Voice-Used": used_voice})
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"TTS error: {exc}")
+
+
+@app.post("/api/render")
+async def render_video(request: RenderRequest):
+    try:
+        path = await render_script(request)
+        return {"output": str(path)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
+
+
+# ---------- async render with status tracking ----------
+
+
+def _set_status(task_id: str, **kwargs: Any) -> None:
+    STATUS.setdefault(task_id, {})
+    STATUS[task_id].update(kwargs)
+    STATUS[task_id]["updated_at"] = asyncio.get_event_loop().time()
+
+
+async def _run_render_task(task_id: str, request: RenderRequest) -> None:
+    try:
+        _set_status(task_id, stage="queued", progress=0.0, message="Iniciando", done=False, error=None, output=None)
+
+        def _progress(stage: str, pct: float, msg: str):
+            _set_status(task_id, stage=stage, progress=pct, message=msg)
+
+        path = await render_script(request, progress_cb=_progress)
+        _set_status(task_id, stage="done", progress=1.0, message="Concluído", done=True, output=str(path))
+    except Exception as exc:  # noqa: BLE001
+        _set_status(task_id, stage="error", error=str(exc), done=True)
+
+
+@app.post("/api/render/start")
+async def render_start(request: RenderRequest):
+    task_id = uuid.uuid4().hex
+    asyncio.create_task(_run_render_task(task_id, request))
+    return {"task_id": task_id}
+
+
+@app.get("/api/render/status/{task_id}")
+async def render_status(task_id: str):
+    data = STATUS.get(task_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return data
