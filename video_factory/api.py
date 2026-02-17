@@ -4,9 +4,12 @@ import sys
 import asyncio
 import uuid
 from typing import Any, Dict
-from fastapi import FastAPI, Query, Response, HTTPException
+from fastapi import FastAPI, Query, Response, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 import edge_tts
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from pathlib import Path
 
@@ -14,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT.parent) not in sys.path:
     sys.path.append(str(ROOT.parent))
 
-from video_factory.tts_generator import synthesize_to_bytes  # noqa: E402
+from video_factory.tts_generator import synthesize_to_bytes, synthesize_to_bytes_with_metadata  # noqa: E402
 from video_factory.config import EDGE_VOICE  # noqa: E402
 from video_factory.render_pipeline import RenderRequest, render_script  # noqa: E402
 
@@ -32,8 +35,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve assets (videos/images/audio) for UI playback
+app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
+
 # Store of render task statuses (in-memory)
 STATUS: Dict[str, Dict[str, Any]] = {}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Retorna detalhes claros quando o corpo recebido nÃ£o bate com RenderRequest.
+    Ajuda a depurar erros 422 no frontend.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body},
+    )
 
 
 @app.on_event("startup")
@@ -82,40 +100,22 @@ async def _try_voices(text: str, voices: list[str]) -> tuple[bytes, str]:
 
 @app.get("/api/tts/preview")
 async def tts_preview(text: str = Query(..., min_length=1, max_length=300), voice: str | None = None):
-    if not VOICE_IDS:
-        await load_voices()
-    chosen_voice = voice or EDGE_VOICE
-    if chosen_voice not in VOICE_IDS:
-        chosen_voice = EDGE_VOICE if EDGE_VOICE in VOICE_IDS else (next(iter(VOICE_IDS), EDGE_VOICE))
-
-    chosen_gender = VOICE_BY_ID.get(chosen_voice, {}).get("gender", "Unknown")
-    male_ids = [vid for vid, meta in VOICE_BY_ID.items() if meta.get("gender") == "Male"]
-    female_ids = [vid for vid, meta in VOICE_BY_ID.items() if meta.get("gender") == "Female"]
-
-    # ordem de fallback: tenta manter o mesmo gênero quando possível
-    if chosen_gender == "Male":
-        fallback_order = [chosen_voice] + [vid for vid in male_ids if vid != chosen_voice]
-        if EDGE_VOICE in VOICE_IDS and EDGE_VOICE not in fallback_order:
-            fallback_order.append(EDGE_VOICE)
-        fallback_order += [vid for vid in female_ids if vid not in fallback_order]
-    else:
-        fallback_order = [chosen_voice]
-        if EDGE_VOICE in VOICE_IDS and EDGE_VOICE not in fallback_order:
-            fallback_order.append(EDGE_VOICE)
-        fallback_order += [vid for vid in female_ids if vid not in fallback_order]
-        fallback_order += [vid for vid in male_ids if vid not in fallback_order]
+    """
+    Prévia TTS usando ordem de providers definida em TTS_PROVIDER (edge,offline,...).
+    Não depende de listar vozes do Edge, funciona offline.
+    """
     try:
-        audio_bytes, used_voice = await _try_voices(text, fallback_order)
-        return Response(content=audio_bytes, media_type="audio/mpeg", headers={"X-Voice-Used": used_voice})
+        audio_bytes, meta, ext = await synthesize_to_bytes_with_metadata(text, voice or EDGE_VOICE)
+        media = "audio/mpeg" if (ext or "").lower() in {"mp3", "mpeg"} else "audio/wav"
+        return Response(content=audio_bytes, media_type=media, headers={"X-Voice-Used": voice or EDGE_VOICE})
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"TTS error: {exc}")
-
 
 @app.post("/api/render")
 async def render_video(request: RenderRequest):
     try:
         path = await render_script(request)
-        return {"output": str(path)}
+        return {"output": str(path), "web_url": _path_to_web(path)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
 
@@ -128,6 +128,20 @@ def _set_status(task_id: str, **kwargs: Any) -> None:
     STATUS[task_id].update(kwargs)
     STATUS[task_id]["updated_at"] = asyncio.get_event_loop().time()
 
+@app.get("/api/ping")
+async def ping():
+    return {"status": "ok"}
+
+def _path_to_web(path: Path | str | None) -> str | None:
+    if not path:
+        return None
+    p = Path(path)
+    try:
+        rel = p.relative_to(ROOT)
+        return "/assets/" + rel.as_posix().split("assets/", 1)[-1] if "assets/" in rel.as_posix() else "/assets/" + rel.as_posix()
+    except Exception:
+        return None
+
 
 async def _run_render_task(task_id: str, request: RenderRequest) -> None:
     try:
@@ -137,7 +151,8 @@ async def _run_render_task(task_id: str, request: RenderRequest) -> None:
             _set_status(task_id, stage=stage, progress=pct, message=msg)
 
         path = await render_script(request, progress_cb=_progress)
-        _set_status(task_id, stage="done", progress=1.0, message="Concluído", done=True, output=str(path))
+        web = _path_to_web(path)
+        _set_status(task_id, stage="done", progress=1.0, message="Concluído", done=True, output=str(path), web_url=web)
     except Exception as exc:  # noqa: BLE001
         _set_status(task_id, stage="error", error=str(exc), done=True)
 

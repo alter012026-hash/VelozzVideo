@@ -84,6 +84,7 @@ const App: React.FC = () => {
   const [isGeneratingNarration, setIsGeneratingNarration] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
+  const [apiBase, setApiBase] = useState<string>('');
   const [renderTaskId, setRenderTaskId] = useState<string | null>(null);
   const [renderProgress, setRenderProgress] = useState<number>(0);
   const [renderStage, setRenderStage] = useState<string>('');
@@ -147,6 +148,51 @@ const App: React.FC = () => {
   const [gridError, setGridError] = useState<string | null>(null);
   const [gridSceneTarget, setGridSceneTarget] = useState<string | null>(null);
 
+  // resolve API base (auto fallback, scans common ports)
+  useEffect(() => {
+    let cancelled = false;
+    const resolveApi = async () => {
+      const saved = localStorage.getItem('vv_api_base');
+      const envBase = (import.meta as any).env?.API_HOST || (import.meta as any).env?.VITE_API_HOST;
+      const portRange = Array.from({ length: 11 }, (_, i) => 8000 + i);
+      const portCandidates = portRange.flatMap(p => [`http://127.0.0.1:${p}`, `http://localhost:${p}`]);
+      const candidates = [
+        saved,
+        envBase,
+        window.location.origin,
+        ...portCandidates,
+      ].filter(Boolean) as string[];
+
+      for (const base of candidates) {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 1200);
+          const res = await fetch(`${base}/api/ping`, { signal: ctrl.signal });
+          clearTimeout(timer);
+          if (res.ok) {
+            if (!cancelled) {
+              setApiBase(base);
+              localStorage.setItem('vv_api_base', base);
+            }
+            return;
+          }
+        } catch (err) {
+          continue;
+        }
+      }
+      setApiBase('');
+    };
+    resolveApi();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const apiFetch = (path: string, options?: RequestInit) => {
+    if (!apiBase) throw new Error('API indisponível');
+    return fetch(`${apiBase}${path}`, options);
+  };
+
   const pushLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') => {
     const time = new Date().toLocaleTimeString();
     setLogFeed(prev => [{ id: Math.random().toString(36).slice(2), msg, level, time }, ...prev].slice(0, 12));
@@ -201,12 +247,13 @@ const App: React.FC = () => {
     setGridSceneTarget(payload.gridSceneTarget || null);
     if (payload.edgeVoiceId) setEdgeVoiceId(payload.edgeVoiceId);
     if (payload.script) {
-      const scenesWithStatus = payload.script.scenes.map(s => ({
+      const scenesWithStatus = payload.script.scenes.map((s, idx) => ({
         ...s,
+        id: String((s as any).id ?? idx + 1),
         status: s.status ?? 'completed',
         transition: s.transition || payload.settings?.defaultTransition || settings.defaultTransition || 'fade',
         filter: s.filter || payload.settings?.defaultFilter || settings.defaultFilter || 'none',
-        flowTo: typeof s.flowTo === 'string' ? s.flowTo : null,
+        flowTo: typeof s.flowTo === 'string' ? String(s.flowTo) : null,
       }));
       setScript({ ...payload.script, scenes: scenesWithStatus });
       setCurrentStep('assets');
@@ -375,7 +422,7 @@ const App: React.FC = () => {
     // carrega vozes do backend
     const loadVoices = async () => {
       try {
-        const res = await fetch('/api/tts/voices');
+      const res = await apiFetch('/api/tts/voices');
         if (!res.ok) throw new Error('Falha ao listar vozes');
         const data = await res.json();
         const desiredVoice = storedEdgeVoice || edgeVoiceId;
@@ -531,7 +578,7 @@ const App: React.FC = () => {
     setIsPreviewingVoice(true);
     try {
       localStorage.setItem('edge_voice', edgeVoiceId);
-      const res = await fetch(`/api/tts/preview?text=${encodeURIComponent(previewText || 'Previa de voz')}&voice=${encodeURIComponent(edgeVoiceId)}`);
+      const res = await apiFetch(`/api/tts/preview?text=${encodeURIComponent(previewText || 'Previa de voz')}&voice=${encodeURIComponent(edgeVoiceId)}`);
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err?.detail || `HTTP ${res.status}`);
@@ -593,12 +640,13 @@ const App: React.FC = () => {
       const resData = await response.json();
       const data = JSON.parse(String(resData.response));
       
-      const scenesWithStatus = data.scenes.map((s: any) => ({
+      const scenesWithStatus = data.scenes.map((s: any, idx: number) => ({
         ...s,
+        id: String(s.id ?? idx + 1),
         status: 'completed',
         transition: settings.defaultTransition,
         filter: settings.defaultFilter,
-        flowTo: null,
+        flowTo: s.flowTo ? String(s.flowTo) : null,
       }));
       setScript({ ...data, scenes: scenesWithStatus });
       setCurrentStep('assets');
@@ -627,9 +675,13 @@ const App: React.FC = () => {
     });
 
   const generateNarration = async (sceneId: string, text: string) => {
+    if (!apiBase) {
+      setStatusMessage('API indisponível para prévia de voz');
+      return;
+    }
     setIsGeneratingNarration(sceneId);
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/tts/preview?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(edgeVoiceId)}`
       );
       if (!res.ok) {
@@ -805,6 +857,10 @@ const App: React.FC = () => {
 
   const generateFullVideo = async () => {
     if (!script) return;
+    if (!apiBase) {
+      setStatusMessage('API indisponível para render');
+      return;
+    }
 
     setIsGeneratingVideo(true);
     setCurrentStep('rendering');
@@ -824,26 +880,30 @@ const App: React.FC = () => {
 
       const payload = {
         scenes: script.scenes.map(s => ({
-          id: s.id,
+          id: String(s.id),
           text: s.text,
           visualPrompt: s.visualPrompt,
           localImage: s.localImage,
           animationType: (s as any).animationType,
           transition: s.transition || settings.defaultTransition,
           filter: s.filter || settings.defaultFilter,
-          flowTo: s.flowTo || null,
+          flowTo: s.flowTo ? String(s.flowTo) : null,
         })),
         format,
         voice: edgeVoiceId,
         scriptTitle: script.title,
       };
 
-      const startRes = await fetch('/api/render/start', {
+      const startRes = await apiFetch('/api/render/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!startRes.ok) throw new Error(`Falha ao iniciar render: HTTP ${startRes.status}`);
+      if (!startRes.ok) {
+        const err = await startRes.json().catch(() => ({}));
+        const msg = err?.detail ? JSON.stringify(err.detail) : `HTTP ${startRes.status}`;
+        throw new Error(`Falha ao iniciar render: ${msg}`);
+      }
       const { task_id } = await startRes.json();
       setRenderTaskId(task_id);
       setStatusMessage('Render em andamento...');
@@ -851,7 +911,7 @@ const App: React.FC = () => {
 
       let done = false;
       while (!done) {
-        const stRes = await fetch(`/api/render/status/${task_id}`);
+        const stRes = await apiFetch(`/api/render/status/${task_id}`);
         if (!stRes.ok) throw new Error(`Falha ao consultar status: HTTP ${stRes.status}`);
         const st = await stRes.json();
         setRenderStage(st.stage || '');
@@ -860,8 +920,9 @@ const App: React.FC = () => {
         if (st.done) {
           done = true;
           if (st.error) throw new Error(st.error);
-          setVideoUrl(st.output || null);
-          pushLog(`Render concluído: ${st.output}`, 'info');
+          const url = st.web_url || st.output || null;
+          setVideoUrl(url);
+          pushLog(`Render concluído: ${url || st.output}`, 'info');
           setCurrentStep('done');
         } else {
           await new Promise(r => setTimeout(r, 1500));
@@ -893,7 +954,7 @@ const App: React.FC = () => {
         voice: edgeVoiceId,
         scriptTitle: 'Teste local',
       };
-      const response = await fetch('/api/render', {
+      const response = await apiFetch('/api/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(testRequest),

@@ -34,8 +34,8 @@ LLM_API_BASE = env("LLM_API_BASE")  # Ex.: https://api.openai.com/v1
 IMAGE_API_KEY = env("IMAGE_API_KEY")
 
 # Roteiro / narração
-WORDS_PER_MINUTE = int(env("WORDS_PER_MINUTE", "170"))
-SCENE_COUNTS = {1: int(env("SCENES_PER_MIN_1", "10")), 5: int(env("SCENES_PER_MIN_5", "16"))}
+WORDS_PER_MINUTE = int(env("WORDS_PER_MINUTE", "160"))
+SCENE_COUNTS = {1: int(env("SCENES_PER_MIN_1", "6")), 5: int(env("SCENES_PER_MIN_5", "14"))}
 SCRIPT_CHUNK_ENABLED = env("SCRIPT_CHUNK_ENABLED", "0").lower() in {"1", "true", "yes"}
 SCRIPT_CHUNK_SCENES = int(env("SCRIPT_CHUNK_SCENES", "4"))
 SCRIPT_CHUNK_CONTEXT_SCENES = int(env("SCRIPT_CHUNK_CONTEXT_SCENES", "2"))

@@ -60,12 +60,26 @@ def _pyttsx3_voice_id(engine, voice_hint: str | None) -> str | None:
     return None
 
 
+def _pyttsx3_first_match(engine, pref_lang: str = "pt") -> str | None:
+    pref_lang = (pref_lang or "").lower()
+    voices = engine.getProperty("voices") or []
+    # 1) exact lang match (starts with pref_lang)
+    for v in voices:
+        lang_raw = v.languages[0] if (getattr(v, "languages", None)) else ""
+        if isinstance(lang_raw, (bytes, bytearray)):
+            lang_raw = lang_raw.decode(errors="ignore")
+        lang = str(lang_raw).lower()
+        if lang.startswith(pref_lang):
+            return v.id
+    # 2) first available
+    return voices[0].id if voices else None
+
+
 def _offline_tts_bytes(text: str, voice: str | None = None) -> bytes:
     engine = pyttsx3.init()
-    vid = _pyttsx3_voice_id(engine, voice or EDGE_VOICE)
+    vid = _pyttsx3_voice_id(engine, voice or EDGE_VOICE) or _pyttsx3_first_match(engine, "pt")
     if vid:
         engine.setProperty("voice", vid)
-    # velocidade mais natural
     rate = engine.getProperty("rate")
     engine.setProperty("rate", int(rate * 0.95))
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
@@ -108,7 +122,6 @@ async def synthesize_to_bytes_with_metadata(text: str, voice: str | None = None)
             last_err = exc
             log.warning("Provider TTS '%s' falhou: %s", provider, exc)
             continue
-    # se todos falharem, propaga último erro
     if last_err:
         raise last_err
     raise RuntimeError("Nenhum provider TTS configurado.")

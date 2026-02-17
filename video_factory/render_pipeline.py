@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import uuid
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Callable
@@ -22,6 +23,13 @@ if not logger.handlers:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     )
+
+
+def _safe_slug(value: str, fallback: str = "render") -> str:
+    clean = re.sub(r"[\\/:*?\"<>|]", "", value or "")
+    clean = re.sub(r"\s+", "_", clean).strip("_")
+    clean = re.sub(r"[^A-Za-z0-9._-]", "", clean)
+    return clean or fallback
 
 
 class RenderScene(BaseModel):
