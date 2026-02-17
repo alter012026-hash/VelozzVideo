@@ -1359,22 +1359,22 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
 
   return (
     <div className="min-h-screen bg-[#020617] selection:bg-blue-500/30">
-      <div className="max-w-7xl mx-auto p-4 md:p-6 flex flex-col md:flex-row gap-6">
+      <div className="max-w-[1700px] mx-auto p-4 md:p-6 flex flex-col lg:flex-row gap-6">
         {/* SIDEBAR */}
-        <aside className="w-full md:w-80 flex flex-col gap-4">
+        <aside className="w-full lg:w-[360px] xl:w-[380px] shrink-0 flex flex-col gap-4">
           <div className="glass p-4 rounded-2xl border-white/5 shadow-2xl">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-3">
               <div>
                 <h1 className="text-2xl font-extrabold font-display gradient-text tracking-tighter">VelozzVideo</h1>
                 <p className="text-gray-500 text-[11px] font-bold uppercase tracking-[0.18em]">Fluxo Local + API</p>
               </div>
-              <div className="flex gap-2">
-                <button onClick={restoreSession} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all">Recuperar sessão</button>
-                <button onClick={restorePreviousSession} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-amber-500/40 text-amber-300 hover:text-white hover:border-amber-400 transition-all">Sessão anterior</button>
-                <button onClick={resetProject} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-red-500/40 text-red-300 hover:text-white hover:border-red-400 transition-all">Resetar</button>
+              <div className="grid grid-cols-3 gap-2">
+                <button onClick={restoreSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all leading-tight text-center">Recuperar sess�o</button>
+                <button onClick={restorePreviousSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-amber-500/40 text-amber-300 hover:text-white hover:border-amber-400 transition-all leading-tight text-center">Sess�o anterior</button>
+                <button onClick={resetProject} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-red-500/40 text-red-300 hover:text-white hover:border-red-400 transition-all leading-tight text-center">Resetar</button>
               </div>
             </div>
-            <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] text-gray-400">
+            <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] text-gray-400"> 
               <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Etapa: <span className="text-white">{currentStep}</span></div>
               <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Form.: {format}</div>
               <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Duração: {videoLength === '1m' ? '1m' : '5m'}</div>
@@ -1382,6 +1382,39 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
             <div className="mt-3 h-2 w-full bg-gray-900 rounded-full overflow-hidden">
               <div className="h-full bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500" style={{ width: `${progress}%` }}></div>
             </div>
+          </div>
+
+          <div className="glass p-5 rounded-3xl border-blue-500/15 flex flex-col gap-3 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-black uppercase tracking-[0.2em] text-blue-400">Status de Producao</span>
+              <span className="text-[10px] font-mono text-gray-400">{Math.max(0, renderProgress).toFixed(0)}%</span>
+            </div>
+            <div className="h-2 w-full bg-gray-900 rounded-full overflow-hidden">
+              <div className="h-full bg-gradient-to-r from-blue-500 via-cyan-400 to-emerald-400 transition-all duration-300" style={{ width: `${Math.max(0, Math.min(100, renderProgress))}%` }}></div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-300">
+              <div className="bg-black/30 border border-gray-800 rounded-xl px-2 py-1.5">
+                <div className="text-gray-500 uppercase tracking-widest text-[9px]">Etapa</div>
+                <div className="text-white font-mono mt-0.5">{renderStage || currentStep}</div>
+              </div>
+              <div className="bg-black/30 border border-gray-800 rounded-xl px-2 py-1.5">
+                <div className="text-gray-500 uppercase tracking-widest text-[9px]">Task</div>
+                <div className="text-white font-mono mt-0.5">{renderTaskId ? renderTaskId.slice(0, 8) : "-"}</div>
+              </div>
+              <div className="bg-black/30 border border-gray-800 rounded-xl px-2 py-1.5">
+                <div className="text-gray-500 uppercase tracking-widest text-[9px]">Cards</div>
+                <div className="text-white font-mono mt-0.5">{script?.scenes.length || 0}</div>
+              </div>
+              <div className="bg-black/30 border border-gray-800 rounded-xl px-2 py-1.5">
+                <div className="text-gray-500 uppercase tracking-widest text-[9px]">Assets</div>
+                <div className="text-emerald-300 font-mono mt-0.5">{script ? script.scenes.filter(s => s.localImage).length : 0}</div>
+              </div>
+            </div>
+            {statusMessage && (
+              <div className="text-[10px] text-gray-300 bg-black/30 border border-gray-800 rounded-xl px-3 py-2">
+                {statusMessage}
+              </div>
+            )}
           </div>
 
           {/* Roteiro Local */}
@@ -1550,47 +1583,6 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                   )}
                 </div>
 
-                <div className="mt-3 p-3 rounded-2xl bg-black/30 border border-cyan-500/20">
-                  <div className="flex items-center justify-between mb-2">
-                    <p className="text-[10px] uppercase font-black text-cyan-300">Lab de Efeitos (Prévia rápida)</p>
-                    <span className="text-[10px] text-gray-500">MoviePy</span>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Transição</label>
-                      <select value={previewTransition} onChange={e => setPreviewTransition(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
-                        {transitionOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Animação</label>
-                      <select value={previewAnimation} onChange={e => setPreviewAnimation(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
-                        {animationOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Filtro</label>
-                      <select value={previewFilter} onChange={e => setPreviewFilter(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
-                        {filterOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Força do filtro ({previewColorStrength.toFixed(2)})</label>
-                      <input type="range" min={0} max={1.5} step={0.05} value={previewColorStrength} onChange={e => setPreviewColorStrength(parseFloat(e.target.value))} className="accent-cyan-400" />
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 mt-3">
-                    <button onClick={previewVideoEffects} disabled={isPreviewRendering} className="px-3 py-2 rounded-xl bg-cyan-600/80 hover:bg-cyan-500 text-white text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
-                      {isPreviewRendering ? 'Gerando...' : 'Gerar prévia'}
-                    </button>
-                    <span className="text-[10px] text-gray-400">Gera MP4 de 3-4s com 2 cenas para validar transição + filtro + animação.</span>
-                  </div>
-                  {previewUrl && (
-                    <div className="mt-3 rounded-xl overflow-hidden border border-cyan-500/30 bg-black/40 p-2">
-                      <video src={previewUrl} className="w-full rounded-lg" controls muted loop playsInline />
-                    </div>
-                  )}
-                </div>
               </>
             )}
           </div>
@@ -1751,7 +1743,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         </aside>
 
         {/* MAIN WORKSPACE */}
-        <main className="flex-1 flex flex-col gap-6">
+        <main className="min-w-0 flex-1 flex flex-col gap-6">
           <div className="glass p-5 rounded-2xl border-white/5 shadow-2xl flex flex-col lg:flex-row gap-4 items-stretch">
             <div className="flex-1">
               <input
@@ -1813,7 +1805,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
             <div
               ref={canvasScrollRef}
               onWheel={handleCanvasWheel}
-              className="relative h-[520px] md:h-[600px] overflow-auto rounded-2xl border border-gray-800 bg-[radial-gradient(circle_at_1px_1px,rgba(148,163,184,0.10)_1px,transparent_1px)] [background-size:24px_24px]"
+              className="relative h-[520px] md:h-[620px] xl:h-[700px] overflow-auto rounded-2xl border border-gray-800 bg-[radial-gradient(circle_at_1px_1px,rgba(148,163,184,0.10)_1px,transparent_1px)] [background-size:24px_24px]"
             >
               {!script && (
                 <div className="absolute inset-0 flex items-center justify-center text-gray-600 text-sm">
@@ -2119,10 +2111,10 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       </div>
           </div>
 
-          {/* RENDER + STATUS */}
+          {/* RENDER */}
           {script && (
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pb-12">
-              <div className="lg:col-span-7 glass rounded-[2.5rem] p-6 min-h-[360px] flex flex-col gap-4 relative border border-gray-800/70 overflow-hidden shadow-2xl">
+              <div className="lg:col-span-8 glass rounded-[2.5rem] p-6 min-h-[360px] flex flex-col gap-4 relative border border-gray-800/70 overflow-hidden shadow-2xl">
                 {isGeneratingVideo && (
                   <div className="absolute inset-0 bg-black/90 backdrop-blur-2xl z-[60] flex flex-col items-center justify-center rounded-[2.5rem] p-12 text-center">
                     <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-6"></div>
@@ -2167,16 +2159,9 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                 </div>
               </div>
 
-              <div className="lg:col-span-5 flex flex-col gap-4">
+              <div className="lg:col-span-4 flex flex-col gap-4">
                 <div className="glass p-5 rounded-[2rem] border-blue-500/10 flex flex-col gap-4 shadow-2xl">
-                  <h3 className="font-black text-xs text-blue-500 uppercase tracking-[0.3em]">Status de Produção</h3>
-                  <div className="space-y-3 text-[11px] font-mono">
-                    <div className="flex justify-between"><span className="text-gray-500">TEMA:</span> <span className="text-white">{settings.theme}</span></div>
-                    <div className="flex justify-between"><span className="text-gray-500">NODES:</span> <span className="text-white">{script.scenes.length}</span></div>
-                    <div className="flex justify-between"><span className="text-gray-500">LOCAL:</span> <span className="text-green-500">{script.scenes.filter(s => s.localImage).length} ASSETS</span></div>
-                    <div className="flex justify-between"><span className="text-gray-500">DURAÇÃO:</span> <span className="text-white">{videoLength === '1m' ? '~1 min' : '~5 min'} (máx {maxScenes})</span></div>
-                    <div className="flex justify-between"><span className="text-gray-500">ÁUDIO FUNDO:</span> <span className={settings.localBackgroundMusic ? "text-green-400" : "text-red-400"}>{settings.localBackgroundMusic ? "Local" : "Não definido"}</span></div>
-                  </div>
+                  <h3 className="font-black text-xs text-blue-500 uppercase tracking-[0.3em]">Painel de Render</h3>
 
                   <div className="pt-4 border-t border-gray-800 text-[11px] space-y-3">
                     <div className="flex items-center justify-between gap-2">
@@ -2312,3 +2297,4 @@ const Loader: React.FC = () => (
 
 const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
+
