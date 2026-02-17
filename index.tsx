@@ -38,6 +38,28 @@ interface Script {
 type ScriptSource = 'gemini' | 'ollama';
 type WorkflowStep = 'topic' | 'scripting' | 'assets' | 'rendering' | 'done';
 
+interface GridTile {
+  id: string;
+  row: number;
+  col: number;
+  dataUrl: string;
+}
+
+interface SessionPayload {
+  topic: string;
+  format: '16:9' | '9:16';
+  videoLength: '1m' | '5m';
+  settings: GeneralSettings;
+  script: Script | null;
+  scenePositions: Record<string, { x: number; y: number }>;
+  gridRows: number;
+  gridCols: number;
+  gridSceneTarget: string | null;
+  edgeVoiceId: string;
+}
+
+const SESSION_KEY = 'vv_session';
+
 const App: React.FC = () => {
   const [topic, setTopic] = useState('');
   const [scriptSource, setScriptSource] = useState<ScriptSource>('ollama'); // prioriza local
@@ -79,6 +101,7 @@ const App: React.FC = () => {
     voice: true,
     api: true,
     backend: true,
+    grid: true,
   });
 
   const toggleSection = (key: keyof typeof openSections) =>
@@ -101,6 +124,13 @@ const App: React.FC = () => {
   const [draggingSceneId, setDraggingSceneId] = useState<string | null>(null);
   const dragRef = useRef<{ id: string; startX: number; startY: number; origX: number; origY: number } | null>(null);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
+  const [gridRows, setGridRows] = useState(2);
+  const [gridCols, setGridCols] = useState(3);
+  const [gridFile, setGridFile] = useState<string | null>(null);
+  const [gridTiles, setGridTiles] = useState<GridTile[]>([]);
+  const [gridProcessing, setGridProcessing] = useState(false);
+  const [gridError, setGridError] = useState<string | null>(null);
+  const [gridSceneTarget, setGridSceneTarget] = useState<string | null>(null);
 
   const pushLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') => {
     const time = new Date().toLocaleTimeString();
@@ -141,6 +171,28 @@ const App: React.FC = () => {
   });
 
   const sceneIdKey = script ? script.scenes.map(s => s.id).join('|') : '';
+
+  const applySessionPayload = (payload: SessionPayload | null): boolean => {
+    if (!payload) return false;
+    setTopic(payload.topic ?? '');
+    setFormat(payload.format ?? '16:9');
+    setVideoLength(payload.videoLength ?? '1m');
+    setSettings(prev => payload.settings ? { ...prev, ...payload.settings } : prev);
+    setScenePositions(payload.scenePositions || {});
+    setGridRows(payload.gridRows || 2);
+    setGridCols(payload.gridCols || 3);
+    setGridSceneTarget(payload.gridSceneTarget || null);
+    if (payload.edgeVoiceId) setEdgeVoiceId(payload.edgeVoiceId);
+    if (payload.script) {
+      const scenesWithStatus = payload.script.scenes.map(s => ({ ...s, status: s.status ?? 'completed' }));
+      setScript({ ...payload.script, scenes: scenesWithStatus });
+      setCurrentStep('assets');
+    } else {
+      setScript(null);
+      setCurrentStep('topic');
+    }
+    return true;
+  };
 
   const canvasBounds = useMemo(() => {
     if (!script || script.scenes.length === 0) return { w: MIN_CANVAS_W, h: MIN_CANVAS_H };
@@ -188,6 +240,34 @@ const App: React.FC = () => {
       return next;
     });
   }, [sceneIdKey]);
+
+  useEffect(() => {
+    if (!script || !script.scenes.length) {
+      setGridSceneTarget(null);
+      return;
+    }
+    setGridSceneTarget(prev => script.scenes.find(s => s.id === prev)?.id || script.scenes[0].id);
+  }, [sceneIdKey]);
+
+  useEffect(() => {
+    const payload: SessionPayload = {
+      topic,
+      format,
+      videoLength,
+      settings,
+      script,
+      scenePositions,
+      gridRows,
+      gridCols,
+      gridSceneTarget,
+      edgeVoiceId,
+    };
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+    } catch {
+      // ignore quota issues
+    }
+  }, [topic, format, videoLength, settings, script, scenePositions, gridRows, gridCols, gridSceneTarget, edgeVoiceId]);
 
   const handleCanvasWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     // Ctrl+scroll: zoom (trackpad pinch also triggers ctrlKey on many browsers)
@@ -311,6 +391,94 @@ const App: React.FC = () => {
     loadVoices();
   }, []);
 
+  useEffect(() => {
+    if (!gridFile) {
+      setGridTiles([]);
+      setGridError(null);
+      setGridProcessing(false);
+      return;
+    }
+
+    let cancelled = false;
+    const processGrid = async () => {
+      setGridProcessing(true);
+      setGridError(null);
+      try {
+        const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => resolve(img);
+          img.onerror = (err) => reject(err);
+          img.src = gridFile;
+        });
+
+        if (gridRows <= 0 || gridCols <= 0) {
+          throw new Error('Linhas e colunas devem ser maiores que zero');
+        }
+
+        const totalWidth = image.naturalWidth;
+        const totalHeight = image.naturalHeight;
+        const baseWidth = Math.floor(totalWidth / gridCols);
+        const baseHeight = Math.floor(totalHeight / gridRows);
+        const widths = Array.from({ length: gridCols }, (_, col) =>
+          col === gridCols - 1 ? totalWidth - baseWidth * (gridCols - 1) : baseWidth
+        );
+        const heights = Array.from({ length: gridRows }, (_, row) =>
+          row === gridRows - 1 ? totalHeight - baseHeight * (gridRows - 1) : baseHeight
+        );
+
+        const colOffsets = widths.reduce<number[]>((acc, width, index) => {
+          acc[index] = index === 0 ? 0 : acc[index - 1] + widths[index - 1];
+          return acc;
+        }, []);
+        const rowOffsets = heights.reduce<number[]>((acc, height, index) => {
+          acc[index] = index === 0 ? 0 : acc[index - 1] + heights[index - 1];
+          return acc;
+        }, []);
+
+        const tiles: GridTile[] = [];
+        for (let row = 0; row < gridRows; row += 1) {
+          for (let col = 0; col < gridCols; col += 1) {
+            const sw = widths[col];
+            const sh = heights[row];
+            const sx = colOffsets[col];
+            const sy = rowOffsets[row];
+            const canvas = document.createElement('canvas');
+            canvas.width = sw;
+            canvas.height = sh;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) continue;
+            ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+            tiles.push({
+              id: `tile-${row}-${col}-${Date.now()}`,
+              row,
+              col,
+              dataUrl: canvas.toDataURL('image/png'),
+            });
+          }
+        }
+
+        if (!cancelled) {
+          setGridTiles(tiles);
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          setGridError(err?.message || 'Erro ao processar imagem em grade');
+          setGridTiles([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setGridProcessing(false);
+        }
+      }
+    };
+
+    processGrid();
+    return () => {
+      cancelled = true;
+    };
+  }, [gridFile, gridCols, gridRows]);
+
   const loadOllamaModels = async () => {
     setIsLoadingModels(true);
     setOllamaError(null);
@@ -372,6 +540,22 @@ const App: React.FC = () => {
     // @ts-ignore
     await window.aistudio.openSelectKey();
     setHasApiKey(true);
+  };
+
+  const restoreSession = () => {
+    const stored = localStorage.getItem(SESSION_KEY);
+    if (!stored) {
+      pushLog('Nenhuma sessão salva', 'warn');
+      return;
+    }
+    try {
+      const payload = JSON.parse(stored) as SessionPayload;
+      if (applySessionPayload(payload)) {
+        pushLog('Sessão restaurada', 'info');
+      }
+    } catch (err: any) {
+      pushLog(`Erro ao restaurar sessão: ${err?.message || err}`, 'error');
+    }
   };
 
   const generateScript = async () => {
@@ -520,6 +704,51 @@ const App: React.FC = () => {
     reader.readAsDataURL(file);
   };
 
+  const handleGridUpload = (file: File | null) => {
+    if (!file) {
+      setGridFile(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setGridFile(String(reader.result || ''));
+    };
+    reader.onerror = (err) => {
+      setGridFile(null);
+      pushLog(`Falha ao carregar grade: ${err}`,'error');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const copyTileAsBase64 = async (tile: GridTile) => {
+    if (!navigator.clipboard) {
+      pushLog('Clipboard indisponível', 'warn');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(tile.dataUrl);
+      pushLog('Tile copiado para área de transferência', 'info');
+    } catch (err: any) {
+      pushLog(`Erro ao copiar tile: ${err?.message || err}`, 'error');
+    }
+  };
+
+  const applyTileToScene = async (tile: GridTile) => {
+    if (!gridSceneTarget) {
+      pushLog('Selecione uma cena antes de aplicar o tile', 'warn');
+      return;
+    }
+    try {
+      const res = await fetch(tile.dataUrl);
+      const blob = await res.blob();
+      const file = new File([blob], `tile-${tile.row}-${tile.col}.png`, { type: blob.type });
+      handleFileUpload('scene_image', gridSceneTarget, file);
+      pushLog(`Tile ${tile.row + 1}x${tile.col + 1} aplicado na cena`, 'info');
+    } catch (err: any) {
+      pushLog(`Erro ao aplicar tile: ${err?.message || err}`, 'error');
+    }
+  };
+
   const handleImportScript = (file: File) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -554,6 +783,8 @@ const App: React.FC = () => {
     setVideoUrl(null);
     setCurrentStep('topic');
     setStatusMessage('');
+    setScenePositions({});
+    localStorage.removeItem(SESSION_KEY);
   };
 
   const generateFullVideo = async () => {
@@ -646,7 +877,10 @@ const App: React.FC = () => {
                 <h1 className="text-2xl font-extrabold font-display gradient-text tracking-tighter">VelozzVideo</h1>
                 <p className="text-gray-500 text-[11px] font-bold uppercase tracking-[0.18em]">Fluxo Local + API</p>
               </div>
-              <button onClick={resetProject} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-red-500/40 text-red-300 hover:text-white hover:border-red-400 transition-all">Resetar</button>
+              <div className="flex gap-2">
+                <button onClick={restoreSession} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all">Recuperar sessão</button>
+                <button onClick={resetProject} className="text-[10px] font-bold uppercase px-3 py-2 rounded-xl border border-red-500/40 text-red-300 hover:text-white hover:border-red-400 transition-all">Resetar</button>
+              </div>
             </div>
             <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] text-gray-400">
               <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Etapa: <span className="text-white">{currentStep}</span></div>
@@ -1024,9 +1258,114 @@ const App: React.FC = () => {
                       );
                     })}
                   </div>
-                </div>
-              )}
+          </div>
+        )}
+      </div>
+
+      {/* Grid Splitter */}
+      <div className="glass p-5 rounded-3xl border-white/5 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <p className="text-[11px] font-black uppercase text-blue-300">Grid Splitter</p>
+          <button onClick={() => toggleSection('grid')} className="text-[11px] text-gray-400 hover:text-white">
+            {openSections.grid ? '−' : '+'}
+          </button>
+        </div>
+        {openSections.grid && (
+          <>
+            <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-400">
+              <label className="flex flex-col gap-1">
+                <span className="font-black uppercase tracking-[0.3em] text-gray-500">Linhas</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={6}
+                  value={gridRows}
+                  onChange={(e) => setGridRows(Math.max(1, Math.min(6, Number(e.target.value))))}
+                  className="bg-black/40 border border-gray-800 rounded-xl px-3 py-2 text-[10px] text-white outline-none focus:border-blue-500/40"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="font-black uppercase tracking-[0.3em] text-gray-500">Colunas</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={6}
+                  value={gridCols}
+                  onChange={(e) => setGridCols(Math.max(1, Math.min(6, Number(e.target.value))))}
+                  className="bg-black/40 border border-gray-800 rounded-xl px-3 py-2 text-[10px] text-white outline-none focus:border-blue-500/40"
+                />
+              </label>
             </div>
+
+            <div className="flex flex-wrap gap-2 items-center text-[10px] text-gray-400">
+              <label className="inline-flex items-center gap-2 px-3 py-2 bg-purple-600/20 border border-purple-500/40 rounded-xl cursor-pointer hover:border-purple-300 hover:text-white transition-all">
+                Upload grade
+                <input type="file" accept="image/*" className="hidden" onChange={(e) => handleGridUpload(e.target.files?.[0] || null)} />
+              </label>
+              <span>{gridProcessing ? 'Processando a grade...' : gridFile ? 'Grade carregada' : 'Nenhuma imagem'}</span>
+              {gridError && <span className="text-red-400 text-[9px]">{gridError}</span>}
+            </div>
+
+            {script && script.scenes.length > 0 && (
+              <div className="flex items-center gap-2 text-[10px] text-gray-300">
+                <span className="font-black uppercase tracking-[0.3em]">Cena alvo</span>
+                <select
+                  value={gridSceneTarget || ''}
+                  onChange={(e) => setGridSceneTarget(e.target.value || null)}
+                  className="bg-black/40 border border-gray-800 rounded-xl px-3 py-2 text-[10px] text-white outline-none focus:border-blue-500/40"
+                >
+                  {script.scenes.map((scene, idx) => (
+                    <option key={scene.id} value={scene.id}>
+                      {`${idx + 1}. ${scene.visualPrompt?.slice(0, 18) || 'Cena'}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div className="grid grid-cols-3 gap-2">
+              {gridTiles.length === 0 && !gridProcessing && (
+                <div className="col-span-3 text-[10px] text-gray-500 text-center">Use o upload para fatiar uma grade.</div>
+              )}
+              {gridTiles.map(tile => (
+                <div key={tile.id} className="bg-black/30 border border-gray-800 rounded-2xl overflow-hidden flex flex-col gap-2 text-[9px] text-gray-200">
+                  <div className="h-20 overflow-hidden">
+                    <img src={tile.dataUrl} className="w-full h-full object-cover" />
+                  </div>
+                  <div className="px-2 flex items-center justify-between">
+                    <span>R{tile.row + 1} C{tile.col + 1}</span>
+                    <span>{gridSceneTarget ? 'Target' : 'Sem cena'}</span>
+                  </div>
+                  <div className="px-2 flex gap-1">
+                    <a
+                      href={tile.dataUrl}
+                      download={`grid-${tile.row + 1}x${tile.col + 1}.png`}
+                      className="flex-1 text-center px-2 py-1 rounded-xl border border-gray-700 hover:border-blue-500 hover:text-white transition-all"
+                    >
+                      Baixar
+                    </a>
+                    <button
+                      onClick={() => copyTileAsBase64(tile)}
+                      className="flex-1 px-2 py-1 rounded-xl border border-gray-700 hover:border-blue-500 hover:text-white transition-all"
+                    >
+                      Copiar
+                    </button>
+                  </div>
+                  <div className="px-2 pb-2">
+                    <button
+                      disabled={!gridSceneTarget}
+                      onClick={() => applyTileToScene(tile)}
+                      className="w-full text-[9px] font-black uppercase tracking-[0.2em] px-2 py-1 rounded-xl border border-blue-500/40 bg-blue-600/20 text-blue-200 hover:border-blue-300 hover:text-white transition-all disabled:opacity-40"
+                    >
+                      Aplicar à cena
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
           </div>
 
           {/* RENDER + STATUS */}
