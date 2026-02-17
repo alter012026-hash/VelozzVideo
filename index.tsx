@@ -198,18 +198,26 @@ const App: React.FC = () => {
   useEffect(() => {
     let cancelled = false;
     const resolveApi = async () => {
+      const requiredRevision = '2026-02-17-audiofix-1';
       const saved = localStorage.getItem('vv_api_base');
       const envBase = (import.meta as any).env?.API_HOST || (import.meta as any).env?.VITE_API_HOST;
       const portRange = Array.from({ length: 11 }, (_, i) => 8000 + i);
       const portCandidates = portRange.flatMap(p => [`http://127.0.0.1:${p}`, `http://localhost:${p}`]);
 
       // Prioriza checar direto nos ports comuns antes de tentar o proxy do dev server, reduzindo erros ECONNREFUSED no console.
-      const candidates = [
-        ...portCandidates,
-        saved,
+      const rawCandidates = [
         envBase,
-        window.location.origin, // por último, pois passa pelo proxy do Vite
+        saved,
+        ...portCandidates,
+        window.location.origin,
       ].filter(Boolean) as string[];
+      const seen = new Set<string>();
+      const candidates = rawCandidates.filter((candidate) => {
+        if (seen.has(candidate)) return false;
+        seen.add(candidate);
+        return true;
+      });
+      let fallbackOkBase: string | null = null;
 
       for (const base of candidates) {
         try {
@@ -218,16 +226,27 @@ const App: React.FC = () => {
           const res = await fetch(`${base}/api/ping`, { signal: ctrl.signal });
           clearTimeout(timer);
           if (res.ok) {
-            if (!cancelled) {
-              setApiBase(base);
-              localStorage.setItem('vv_api_base', base);
+            const data = await res.json().catch(() => ({}));
+            if (data?.revision === requiredRevision) {
+              if (!cancelled) {
+                setApiBase(base);
+                localStorage.setItem('vv_api_base', base);
+              }
+              return;
             }
-            return;
+            if (!fallbackOkBase) fallbackOkBase = base;
           }
         } catch (err) {
           // Apenas segue para o próximo candidato; evita spam de erro
           continue;
         }
+      }
+      if (fallbackOkBase) {
+        if (!cancelled) {
+          setApiBase(fallbackOkBase);
+          localStorage.setItem('vv_api_base', fallbackOkBase);
+        }
+        return;
       }
       setApiBase('');
     };

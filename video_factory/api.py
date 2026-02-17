@@ -47,6 +47,7 @@ app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
 # Store of render task statuses (in-memory)
 STATUS: Dict[str, Dict[str, Any]] = {}
 logger = logging.getLogger("video_factory.api")
+API_REVISION = "2026-02-17-audiofix-1"
 
 
 @app.exception_handler(RequestValidationError)
@@ -180,7 +181,7 @@ def _write_task_error_log(task_id: str, tb: str, err: str) -> Path:
 
 @app.get("/api/ping")
 async def ping():
-    return {"status": "ok"}
+    return {"status": "ok", "revision": API_REVISION}
 
 
 @app.post("/api/cleanup")

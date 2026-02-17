@@ -5,8 +5,8 @@ set ROOT=%~dp0
 set VENV=%ROOT%video_factory\.venv\Scripts
 set API_READY=0
 
-echo [0/4] Encerrando APIs antigas (uvicorn video_factory.api) para evitar codigo stale...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -like 'python*') -and ($_.CommandLine -match 'uvicorn\\s+video_factory\\.api:app') } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Host ('[INFO] Finalizado PID ' + $_.ProcessId) } catch {} }"
+echo [0/4] Limpando listeners antigos nas portas 8000-8010...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -ge 8000 -and $_.LocalPort -le 8010 } | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { try { Stop-Process -Id $_ -Force -ErrorAction Stop; Write-Host ('[INFO] Finalizado PID ' + $_) } catch {} }"
 
 if not exist "%VENV%\python.exe" (
   echo [WARN] Venv nao encontrado. Criando em video_factory\.venv...
