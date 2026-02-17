@@ -20,6 +20,7 @@ if str(ROOT.parent) not in sys.path:
 from video_factory.tts_generator import synthesize_to_bytes, synthesize_to_bytes_with_metadata  # noqa: E402
 from video_factory.config import EDGE_VOICE  # noqa: E402
 from video_factory.render_pipeline import RenderRequest, render_script  # noqa: E402
+from video_factory.cleanup import purge_old_assets  # noqa: E402
 
 # cache de vozes disponíveis (pt-*)
 VOICE_BY_ID: dict[str, dict[str, Any]] = {}
@@ -131,6 +132,16 @@ def _set_status(task_id: str, **kwargs: Any) -> None:
 @app.get("/api/ping")
 async def ping():
     return {"status": "ok"}
+
+
+@app.post("/api/cleanup")
+async def cleanup_cache(max_age_days: int | None = None):
+    """
+    Limpa arquivos antigos de assets (imagens/áudios/vídeos/temp) baseado em max_age_days.
+    Default: config.CACHE_MAX_AGE_DAYS.
+    """
+    result = purge_old_assets(max_age_days)
+    return result
 
 def _path_to_web(path: Path | str | None) -> str | None:
     if not path:

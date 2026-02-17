@@ -101,6 +101,9 @@ const App: React.FC = () => {
   const [edgeVoiceId, setEdgeVoiceId] = useState('pt-BR-ThalitaMultilingualNeural');
   const [edgeVoices, setEdgeVoices] = useState<{ id: string; label: string; gender: string; locale: string }[]>([]);
   const [livePreview, setLivePreview] = useState<{ sceneId: string; label: string } | null>(null);
+  const [cleanupAgeDays, setCleanupAgeDays] = useState<number>(7);
+  const [cleanupResult, setCleanupResult] = useState<string | null>(null);
+  const [isCleaningCache, setIsCleaningCache] = useState(false);
   const staticEdgeVoices = [
     { id: 'pt-BR-ThalitaMultilingualNeural', label: 'ThalitaMultilingualNeural', gender: 'Female', locale: 'pt-BR' },
     { id: 'pt-BR-FranciscaNeural', label: 'FranciscaNeural', gender: 'Female', locale: 'pt-BR' },
@@ -601,6 +604,31 @@ const App: React.FC = () => {
     const errorMessage = String(error?.message || error || 'Erro desconhecido');
     pushLog(`${context} falhou: ${errorMessage}`, 'error');
     setStatusMessage(`${context} falhou: ${errorMessage}`);
+  };
+
+  const cleanupCache = async () => {
+    if (!apiBase) {
+      setStatusMessage('API indisponÃ­vel para limpeza de cache');
+      return;
+    }
+    setIsCleaningCache(true);
+    setCleanupResult(null);
+    try {
+      const days = Math.max(1, Number.isFinite(cleanupAgeDays) ? cleanupAgeDays : 7);
+      const res = await apiFetch(`/api/cleanup?max_age_days=${days}`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const summary = `Removidos ${data.removed ?? '?'} | Mantidos ${data.kept ?? '?'} | Limite ${data.max_age_days ?? days}d`;
+      setCleanupResult(summary);
+      pushLog(`Limpeza concluÃ­da: ${summary}`, 'info');
+    } catch (error: any) {
+      handleAiError(error, 'Limpeza de cache');
+    } finally {
+      setIsCleaningCache(false);
+    }
   };
 
   const restoreSession = () => {
@@ -1686,6 +1714,30 @@ const App: React.FC = () => {
                       </div>
                     </div>
                     {importError && <p className="text-xs text-red-400">{importError}</p>}
+                  </div>
+
+                  <div className="pt-3 border-t border-gray-800 text-[11px] space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-gray-500 font-mono">Limpar cache</span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min={1}
+                          className="w-16 bg-black/40 border border-gray-800 rounded-lg px-2 py-1 text-[10px] text-white outline-none focus:border-blue-500/40"
+                          value={cleanupAgeDays}
+                          onChange={(e) => setCleanupAgeDays(Math.max(1, Number(e.target.value) || 7))}
+                          title="Dias mÃ¡ximos para manter assets"
+                        />
+                        <button
+                          onClick={cleanupCache}
+                          disabled={isCleaningCache}
+                          className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-50 transition-all"
+                        >
+                          {isCleaningCache ? 'Limpando...' : 'Executar'}
+                        </button>
+                      </div>
+                    </div>
+                    {cleanupResult && <p className="text-[10px] text-green-300">{cleanupResult}</p>}
                   </div>
 
                 <div className="pt-4 border-t border-gray-800">

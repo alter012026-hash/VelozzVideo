@@ -5,6 +5,7 @@ Carrega .env (usando python-dotenv) e oferece defaults seguros.
 from __future__ import annotations
 
 import os
+import multiprocessing
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -68,6 +69,8 @@ VIDEO_FORMATS = {
 VIDEO_FPS = FPS
 VIDEO_CODEC = CODEC
 VIDEO_AUDIO_CODEC = AUDIO_CODEC
+VIDEO_PRESET = env("VIDEO_PRESET", "veryfast")
+VIDEO_THREADS = int(env("VIDEO_THREADS", str(max(4, multiprocessing.cpu_count() or 4))))
 
 ANIMATION_INTENSITY = float(env("ANIMATION_INTENSITY", "0.35"))
 FADE_DURATION = float(env("FADE_DURATION", "0.6"))

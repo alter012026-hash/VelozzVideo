@@ -41,6 +41,8 @@ from video_factory.config import (
     TRANSITION_TYPES,
     VIDEO_FORMATS,
     ASSETS_DIR,
+    VIDEO_PRESET,
+    VIDEO_THREADS,
 )
 from video_factory.tts_metadata import WordTiming
 
@@ -310,8 +312,8 @@ class VideoBuilder:
             fps=self.fps,
             codec=CODEC,
             audio_codec=AUDIO_CODEC,
-            threads=4,
-            preset="medium",
+            threads=VIDEO_THREADS,
+            preset=VIDEO_PRESET,
         )
         final_video.close()
         for clip in clips:
