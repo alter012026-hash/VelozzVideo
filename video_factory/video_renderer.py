@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import math
@@ -9,7 +9,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from moviepy.video.fx.FadeIn import FadeIn
@@ -29,6 +29,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from moviepy.Clip import Clip as MoviepyClip
 from moviepy.audio.AudioClip import AudioClip
 import shutil
+from proglog import ProgressBarLogger
 
 from video_factory.config import (
     ANIMATION_INTENSITY,
@@ -49,10 +50,33 @@ from video_factory.config import (
     KARAOKE_MAX_HIGHLIGHTS,
     KARAOKE_MIN_HOLD,
 )
-from video_factory.tts_metadata import WordTiming
+from video_factory.tts_metadata import WordTiming, approximate_word_timings
 from video_factory import config
 
 logger = logging.getLogger(__name__)
+
+
+class _RenderProgressLogger(ProgressBarLogger):
+    """Bridge MoviePy/Proglog progress to our render callback."""
+
+    def __init__(self, progress_cb: Callable[[float, str], None]):
+        super().__init__()
+        self._progress_cb = progress_cb
+        self._last_progress = -1.0
+
+    def bars_callback(self, bar, attr, value, old_value=None):  # type: ignore[override]
+        info = self.bars.get(bar) or {}
+        total = info.get("total")
+        if not total:
+            return
+        try:
+            pct = max(0.0, min(1.0, float(value) / float(total)))
+        except Exception:
+            return
+        if pct - self._last_progress < 0.01 and pct < 1.0:
+            return
+        self._last_progress = pct
+        self._progress_cb(pct, f"Montando video ({int(pct * 100)}%)")
 
 
 def _ensure_dirs() -> None:
@@ -94,7 +118,7 @@ if not hasattr(MoviepyClip, "set_duration"):
 
 class VideoBuilder:
     """
-    Motor de montagem de vídeos que combina MoviePy, transições, efeitos e narração sincronizada.
+    Motor de montagem de vÃ­deos que combina MoviePy, transiÃ§Ãµes, efeitos e narraÃ§Ã£o sincronizada.
     """
 
     def __init__(
@@ -105,6 +129,7 @@ class VideoBuilder:
         transition_duration: Optional[float] = None,
         color_filter: Optional[str] = None,
         color_strength: float = 0.35,
+        image_scale: float = 1.0,
         narration_volume: float = 1.0,
         music_volume: float = 0.25,
         caption_font_scale: float = 1.0,
@@ -114,7 +139,7 @@ class VideoBuilder:
         caption_y_pct: float = 0.82,
     ):
         if format_ratio not in VIDEO_FORMATS:
-            raise ValueError(f"Formato inválido: {format_ratio}")
+            raise ValueError(f"Formato invÃ¡lido: {format_ratio}")
         self.format_ratio = format_ratio
         self.width = VIDEO_FORMATS[format_ratio]["width"]
         self.height = VIDEO_FORMATS[format_ratio]["height"]
@@ -126,6 +151,7 @@ class VideoBuilder:
         )
         self.color_filter = (color_filter or "").lower()
         self.color_strength = max(0.0, min(1.5, color_strength))
+        self.image_scale = max(0.8, min(1.2, float(image_scale)))
         self.narration_volume = max(0.0, float(narration_volume))
         self.music_volume = max(0.0, float(music_volume))
         self.caption_font_scale = max(0.6, min(1.6, float(caption_font_scale)))
@@ -136,8 +162,8 @@ class VideoBuilder:
 
     def _resize_to_cover(self, clip: Any) -> Any:
         """
-        Redimensiona mantendo proporção: preenche o quadro e corta o excedente
-        para evitar distorção.
+        Redimensiona mantendo proporÃ§Ã£o: preenche o quadro e corta o excedente
+        para evitar distorÃ§Ã£o.
         """
         target_aspect = self.width / self.height
         clip_aspect = (clip.w / clip.h) if getattr(clip, "h", 0) else target_aspect
@@ -149,6 +175,38 @@ class VideoBuilder:
             clip = clip.resized(width=self.width)
             clip = clip.cropped(y_center=clip.h / 2, height=self.height)
         return clip
+
+    def _apply_image_scale(self, clip: ImageClip) -> ImageClip:
+        scale = self.image_scale
+        if abs(scale - 1.0) < 1e-6:
+            return clip
+
+        def scale_effect(gf, t):
+            frame = gf(t)
+            h, w = frame.shape[:2]
+            from PIL import Image
+
+            pil_img = Image.fromarray(frame)
+            new_w = max(2, int(round(w * scale)))
+            new_h = max(2, int(round(h * scale)))
+            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+            if scale >= 1.0:
+                x = max(0, (pil_img.width - w) // 2)
+                y = max(0, (pil_img.height - h) // 2)
+                cropped = pil_img.crop((x, y, x + w, y + h))
+                return np.array(cropped)
+
+            mode = pil_img.mode
+            if mode == "RGBA":
+                canvas = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+                canvas.paste(pil_img, ((w - pil_img.width) // 2, (h - pil_img.height) // 2), pil_img)
+            else:
+                canvas = Image.new("RGB", (w, h), (0, 0, 0))
+                canvas.paste(pil_img, ((w - pil_img.width) // 2, (h - pil_img.height) // 2))
+            return np.array(canvas)
+
+        return clip.transform(scale_effect, keep_duration=True)
 
     def _audio_scale(self, clip: Any, volume: float) -> Any:
         if clip is None:
@@ -344,7 +402,7 @@ class VideoBuilder:
         fade_duration: float = 2.0,
     ) -> CompositeVideoClip:
         if not music_path.exists():
-            logger.warning("Música de fundo não encontrada: %s", music_path)
+            logger.warning("MÃºsica de fundo nÃ£o encontrada: %s", music_path)
             return video
 
         try:
@@ -368,6 +426,42 @@ class VideoBuilder:
         final_audio = CompositeAudioClip([video.audio, looped] if video.audio else [looped])
         return video.with_audio(final_audio)
 
+    def _mix_scene_sfx(
+        self,
+        narration: Any,
+        sfx_path: Optional[Path],
+        scene_duration: float,
+        sfx_volume: float,
+    ) -> Any:
+        if narration is None or not sfx_path:
+            return narration
+        if not Path(sfx_path).exists():
+            logger.warning("SFX da cena nao encontrado: %s", sfx_path)
+            return narration
+        try:
+            sfx = AudioFileClip(str(sfx_path))
+        except Exception:
+            logger.exception("Falha ao abrir SFX da cena: %s", sfx_path)
+            return narration
+
+        sfx_duration = float(getattr(sfx, "duration", 0) or 0)
+        if sfx_duration <= 0:
+            try:
+                sfx.close()
+            except Exception:
+                pass
+            return narration
+
+        target = max(0.05, min(scene_duration, sfx_duration))
+        sfx = self._clip_trim(sfx, 0, target)
+        sfx = self._audio_scale(sfx, max(0.0, min(2.0, float(sfx_volume))))
+        fade_in = min(0.08, target * 0.25)
+        fade_out = min(0.12, target * 0.3)
+        sfx = self._audio_fades(sfx, fade_in, fade_out)
+
+        mixed = CompositeAudioClip([narration, sfx.with_start(0)])
+        return self._clip_trim(mixed, 0, scene_duration)
+
     def build_video(
         self,
         visual_paths: List[Path],
@@ -377,11 +471,15 @@ class VideoBuilder:
         music_volume: float | None = None,
         scene_effects: Optional[Sequence[str]] = None,
         scene_word_timings: Optional[Sequence[List[WordTiming]]] = None,
+        scene_texts: Optional[Sequence[str]] = None,
         scene_transitions: Optional[Sequence[str]] = None,
         scene_filters: Optional[Sequence[str]] = None,
+        scene_sfx_paths: Optional[Sequence[Optional[Path]]] = None,
+        scene_sfx_volumes: Optional[Sequence[float]] = None,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> Path:
         if len(visual_paths) != len(audio_paths):
-            raise ValueError("Número de visuais e áudios precisa ser igual.")
+            raise ValueError("NÃºmero de visuais e Ã¡udios precisa ser igual.")
 
         duration = 0
         clips = []
@@ -392,6 +490,9 @@ class VideoBuilder:
             if scene_duration <= 0:
                 logger.warning("Audio da cena %s com duracao invalida; usando fallback.", index + 1)
                 scene_duration = 0.1
+            sfx_path = scene_sfx_paths[index] if scene_sfx_paths and index < len(scene_sfx_paths) else None
+            sfx_volume = scene_sfx_volumes[index] if scene_sfx_volumes and index < len(scene_sfx_volumes) else 0.35
+            audio_clip = self._mix_scene_sfx(audio_clip, sfx_path, scene_duration, sfx_volume)
             animation = scene_effects[index] if scene_effects and index < len(scene_effects) else None
             transition = scene_transitions[index] if scene_transitions and index < len(scene_transitions) else None
             color_filter = scene_filters[index] if scene_filters and index < len(scene_filters) else None
@@ -405,6 +506,9 @@ class VideoBuilder:
                 video_clip = video_clip.with_duration(scene_duration)
             video_clip = video_clip.with_audio(audio_clip)
             timings = scene_word_timings[index] if scene_word_timings and index < len(scene_word_timings) else []
+            if not timings:
+                text = scene_texts[index] if scene_texts and index < len(scene_texts) else ""
+                timings = approximate_word_timings(text, scene_duration)
             if timings:
                 try:
                     video_clip = self._apply_karaoke_overlay(video_clip, timings)
@@ -423,6 +527,9 @@ class VideoBuilder:
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        render_logger = _RenderProgressLogger(progress_cb) if progress_cb else None
+        if progress_cb:
+            progress_cb(0.0, "Preparando render de video")
         final_video.write_videofile(
             str(output_path),
             fps=self.fps,
@@ -430,7 +537,10 @@ class VideoBuilder:
             audio_codec=AUDIO_CODEC,
             threads=VIDEO_THREADS,
             preset=VIDEO_PRESET,
+            logger=render_logger,
         )
+        if progress_cb:
+            progress_cb(1.0, "Render de video concluido")
         final_video.close()
         for clip in clips:
             clip.close()
@@ -438,78 +548,234 @@ class VideoBuilder:
 
     def _apply_karaoke_overlay(self, clip: ImageClip, timings: List[WordTiming]) -> CompositeVideoClip:
         """
-        Aplica legendas karaokê com wrap seguro e caixa de fundo sem sair da área visível.
+        Aplica legendas com janelas curtas e highlight sincronizado por palavra.
         """
-        base_text = " ".join([w.text.strip() for w in timings if w.text.strip()])
-        if not base_text or clip.duration <= 0:
+        if clip.duration <= 0:
             return clip
 
-        font_size = max(26, int(self.height * 0.034 * self.caption_font_scale))
-        box_width = int(self.width * 0.9)
-        y_pos = int(self.height * self.caption_y_pct)
+        min_hold = max(0.05, float(KARAOKE_MIN_HOLD))
+        tokens: List[tuple[str, float, float]] = []
+        for word in timings:
+            text = str(word.text or "").replace("\n", " ").replace("\r", " ").strip()
+            text = re.sub(r"\s+", " ", text).replace("�", "")
+            if not text:
+                continue
+            try:
+                start = max(0.0, float(word.start))
+                end = start + max(min_hold, float(word.duration))
+            except Exception:
+                continue
+            if start >= clip.duration:
+                continue
+            end = min(clip.duration, end)
+            if end <= start:
+                end = min(clip.duration, start + min_hold)
+            parts = [p for p in text.split(" ") if p]
+            if len(parts) <= 1:
+                tokens.append((text, start, end))
+                continue
+            total_span = max(min_hold * len(parts), end - start)
+            part_dur = max(min_hold, total_span / max(1, len(parts)))
+            cursor = start
+            for idx_part, part in enumerate(parts):
+                part_start = cursor
+                part_end = min(clip.duration, part_start + part_dur)
+                if idx_part == len(parts) - 1:
+                    part_end = min(clip.duration, max(part_end, end))
+                if part_end <= part_start:
+                    part_end = min(clip.duration, part_start + min_hold)
+                tokens.append((part, part_start, part_end))
+                cursor = part_end
 
-        # base line (wrap automática)
-        txt = TextClip(
-            base_text.upper(),
-            fontsize=font_size,
-            color=self.caption_color,
-            font="Arial-Bold",
-            method="caption",
-            size=(box_width, None),
-            align="center",
-            stroke_color="#000000",
-            stroke_width=3,
-        ).with_duration(clip.duration)
-        txt = txt.on_color(
-            size=(txt.w + 24, txt.h + 18),
-            color=(0, 0, 0),
-            col_opacity=self.caption_bg_opacity,
-            pos=("center", "center"),
-        ).with_position(("center", y_pos))
-
-        highlight_clips = []
-        tokens = [word for word in timings if word.text.strip()]
         if not tokens:
             return clip
 
-        # Limita quantidade de overlays para evitar estouro de memoria em roteiros longos.
-        max_highlights = max(12, int(KARAOKE_MAX_HIGHLIGHTS))
-        chunk_size = max(1, int(math.ceil(len(tokens) / max_highlights)))
+        tokens.sort(key=lambda item: item[1])
+        normalized: List[tuple[str, float, float]] = []
+        for i, token in enumerate(tokens):
+            text, start, end = token
+            next_start = tokens[i + 1][1] if i + 1 < len(tokens) else None
+            if next_start is not None and next_start > start:
+                end = min(end, next_start)
+                end = max(start + min_hold, end)
+            normalized.append((text, start, min(clip.duration, end)))
+        tokens = normalized
 
-        for i in range(0, len(tokens), chunk_size):
-            chunk = tokens[i : i + chunk_size]
-            content = " ".join(word.text.strip() for word in chunk if word.text.strip())
-            if not content:
+        font_size = max(24, int(self.height * 0.031 * self.caption_font_scale))
+        box_width = int(self.width * 0.84)
+        y_pos = int(self.height * self.caption_y_pct)
+
+        def _ensure_visible_color(color: str, fallback: str = "#FFFFFF") -> str:
+            c = str(color or "").strip()
+            if not re.fullmatch(r"#?[0-9a-fA-F]{6}", c):
+                return fallback
+            if not c.startswith("#"):
+                c = f"#{c}"
+            try:
+                r = int(c[1:3], 16)
+                g = int(c[3:5], 16)
+                b = int(c[5:7], 16)
+                # luminancia muito baixa some sobre fundo escuro
+                if (0.2126 * r + 0.7152 * g + 0.0722 * b) < 45:
+                    return fallback
+            except Exception:
+                return fallback
+            return c
+
+        caption_color = _ensure_visible_color(self.caption_color, "#FFFFFF")
+        highlight_color = _ensure_visible_color(self.caption_highlight, "#FFD166")
+
+        def _wrap_caption_text(text: str, max_chars: int = 34, max_lines: int = 3) -> str:
+            words = [w for w in text.split(" ") if w]
+            if not words:
+                return ""
+            lines: List[str] = []
+            current = ""
+            for word in words:
+                candidate = word if not current else f"{current} {word}"
+                if len(candidate) <= max_chars or not current:
+                    current = candidate
+                    continue
+                lines.append(current)
+                current = word
+                if len(lines) >= max_lines - 1:
+                    break
+            if current:
+                if len(lines) >= max_lines:
+                    lines[-1] = f"{lines[-1]} {current}".strip()
+                else:
+                    lines.append(current)
+            return "\n".join(lines[:max_lines]).strip()
+
+        def _make_caption(text: str, size_px: int, color: str, stroke_color: str, stroke_width: int) -> TextClip:
+            wrapped = _wrap_caption_text(text)
+            if not wrapped:
+                raise RuntimeError("Texto de legenda vazio")
+            base_kwargs = dict(
+                text=wrapped,
+                color=color,
+                method="caption",
+                size=(box_width, None),
+                stroke_color=stroke_color,
+                stroke_width=stroke_width,
+                font_size=size_px,
+                text_align="center",
+                horizontal_align="center",
+                vertical_align="center",
+            )
+            fonts = ["DejaVuSans-Bold", "Arial-Bold", "Arial", None]
+            last_exc: Exception | None = None
+            for font_name in fonts:
+                try:
+                    kwargs = dict(base_kwargs)
+                    if font_name:
+                        kwargs["font"] = font_name
+                    return TextClip(**kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            raise last_exc or RuntimeError("Falha ao criar TextClip de karaoke")
+
+        def _add_caption_bg(text_clip: TextClip, opacity: Optional[float] = None) -> TextClip:
+            bg_opacity = self.caption_bg_opacity if opacity is None else max(0.0, min(1.0, float(opacity)))
+            bg_width = min(self.width - 14, max(64, text_clip.w + 22))
+            bg_height = max(28, text_clip.h + 16)
+            bg_size = (bg_width, bg_height)
+            if hasattr(text_clip, "with_background_color"):
+                if (getattr(text_clip, "w", 0) or 0) < 8 or (getattr(text_clip, "h", 0) or 0) < 8:
+                    return text_clip
+                return text_clip.with_background_color(
+                    size=bg_size,
+                    color=(0, 0, 0),
+                    pos=("center", "center"),
+                    opacity=bg_opacity,
+                )
+            if hasattr(text_clip, "on_color"):
+                if (getattr(text_clip, "w", 0) or 0) < 8 or (getattr(text_clip, "h", 0) or 0) < 8:
+                    return text_clip
+                return text_clip.on_color(
+                    size=bg_size,
+                    color=(0, 0, 0),
+                    col_opacity=bg_opacity,
+                    pos=("center", "center"),
+                )
+            return text_clip
+
+        # Quebra em janelas curtas para leitura e sincronia.
+        chunks: List[List[tuple[str, float, float]]] = []
+        current: List[tuple[str, float, float]] = []
+        for token in tokens:
+            candidate = current + [token]
+            candidate_text = " ".join(item[0] for item in candidate)
+            candidate_span = candidate[-1][2] - candidate[0][1]
+            if current and (
+                len(candidate) > 4
+                or len(candidate_text) > 26
+                or candidate_span > 1.6
+            ):
+                chunks.append(current)
+                current = [token]
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        caption_clips: List[Any] = []
+        for idx, chunk in enumerate(chunks):
+            chunk_text = " ".join(item[0] for item in chunk)
+            if not chunk_text:
                 continue
-            start = max(0.0, min(chunk[0].start, clip.duration))
-            chunk_end = chunk[-1].start + max(chunk[-1].duration, float(KARAOKE_MIN_HOLD))
-            end = max(start + float(KARAOKE_MIN_HOLD), min(clip.duration, chunk_end))
+            start = max(0.0, min(chunk[0][1], clip.duration))
+            if idx + 1 < len(chunks):
+                end = max(start + min_hold, min(clip.duration, chunks[idx + 1][0][1]))
+            else:
+                end = max(start + min_hold, min(clip.duration, chunk[-1][2]))
             if end <= start:
                 continue
             try:
-                high = TextClip(
-                    content.upper(),
-                    fontsize=font_size + 4,
-                    color=self.caption_highlight,
-                    font="Arial-Bold",
-                    method="caption",
-                    size=(box_width, None),
-                    align="center",
-                    stroke_color="#111111",
-                    stroke_width=3,
+                base = _make_caption(
+                    text=chunk_text,
+                    size_px=font_size,
+                    color=caption_color,
+                    stroke_color="#000000",
+                    stroke_width=2,
                 ).with_start(start).with_duration(end - start)
-                high = high.on_color(
-                    size=(high.w + 24, high.h + 18),
-                    color=(0, 0, 0),
-                    col_opacity=self.caption_bg_opacity,
-                    pos=("center", "center"),
-                ).with_position(("center", y_pos))
-                highlight_clips.append(high)
+                base = _add_caption_bg(base).with_position(("center", y_pos))
+                caption_clips.append(base)
             except Exception:
-                logger.debug("Falha ao criar highlight karaoke no chunk %s", i // chunk_size)
+                logger.debug("Falha ao criar legenda base no chunk %s", idx)
                 continue
 
-        overlay = CompositeVideoClip([txt, *highlight_clips], size=(self.width, self.height)).with_duration(clip.duration)
+        # Highlight sincronizado por palavra (ou grupo de palavras em cenas longas).
+        highlight_clips: List[Any] = []
+        max_highlights = max(24, int(KARAOKE_MAX_HIGHLIGHTS))
+        step = max(1, int(math.ceil(len(tokens) / max_highlights)))
+        highlight_y = max(8, y_pos - int(font_size * 1.25))
+        for i in range(0, len(tokens), step):
+            group = tokens[i : i + step]
+            text = " ".join(item[0] for item in group)
+            start = group[0][1]
+            end = group[-1][2]
+            if not text or end <= start:
+                continue
+            try:
+                hi = _make_caption(
+                    text=text,
+                    size_px=max(20, int(font_size * 0.9)),
+                    color=highlight_color,
+                    stroke_color="#111111",
+                    stroke_width=2,
+                ).with_start(start).with_duration(end - start)
+                hi = _add_caption_bg(hi, opacity=max(0.12, self.caption_bg_opacity * 0.7)).with_position(("center", highlight_y))
+                highlight_clips.append(hi)
+            except Exception:
+                logger.debug("Falha ao criar highlight karaoke no grupo %s", i // step)
+                continue
+
+        if not caption_clips and not highlight_clips:
+            return clip
+
+        overlay = CompositeVideoClip([*caption_clips, *highlight_clips], size=(self.width, self.height)).with_duration(clip.duration)
         combined = CompositeVideoClip([clip, overlay.with_position((0, 0))], size=(self.width, self.height)).with_duration(clip.duration)
         if clip.audio:
             combined = combined.with_audio(clip.audio)
@@ -565,6 +831,7 @@ class VideoBuilder:
         else:
             clip = ImageClip(str(visual_path)).with_duration(duration)
             clip = self._resize_to_cover(clip)
+        clip = self._apply_image_scale(clip)
         animation = animation_type or self._default_animation_type(ext)
         clip = self._apply_animation(clip, animation)
         return self._apply_color_filter(clip, override=color_filter)
@@ -599,12 +866,24 @@ class VideoBuilder:
         if animation_type == "rotate_right":
             return self._apply_rotate(clip, direction=1)
         if animation_type == "sway":
-            return self._apply_sway(clip)
+            sway_fn = getattr(self, "_apply_sway", None)
+            if callable(sway_fn):
+                return sway_fn(clip)
+            logger.warning("Animacao 'sway' indisponivel nesta versao; usando pan_left como fallback.")
+            return self._apply_pan(clip, direction="left")
         if animation_type in {"warp", "warp_in", "warp_out"}:
             direction = -1 if animation_type == "warp_out" else 1
-            return self._apply_warp(clip, direction=direction)
+            warp_fn = getattr(self, "_apply_warp", None)
+            if callable(warp_fn):
+                return warp_fn(clip, direction=direction)
+            logger.warning("Animacao 'warp' indisponivel nesta versao; usando zoom_in como fallback.")
+            return self._apply_zoom(clip, zoom_in=True)
         if animation_type == "pulse":
-            return self._apply_pulse(clip)
+            pulse_fn = getattr(self, "_apply_pulse", None)
+            if callable(pulse_fn):
+                return pulse_fn(clip)
+            logger.warning("Animacao 'pulse' indisponivel nesta versao; usando zoom_in como fallback.")
+            return self._apply_zoom(clip, zoom_in=True)
         return self._apply_zoom(clip, zoom_in=True)
 
     def _apply_zoom(self, clip: ImageClip, zoom_in: bool = True, intensity: float = ANIMATION_INTENSITY) -> ImageClip:
@@ -747,7 +1026,7 @@ class VideoBuilder:
 def run_ffmpeg_filtergraph(input_path: Path, filtergraph: str) -> Path | None:
     """
     Aplica um filtergraph FFmpeg no arquivo gerado e devolve novo caminho.
-    Mantém áudio original, reencoda vídeo com codec configurado.
+    MantÃ©m Ã¡udio original, reencoda vÃ­deo com codec configurado.
     """
     if not filtergraph or not shutil.which("ffmpeg"):
         return None
@@ -786,7 +1065,7 @@ def _make_placeholder_image(text: str, format_ratio: str) -> Path:
     width, height = int(size["width"]), int(size["height"])
     img = Image.new("RGB", (width, height), color=(12, 16, 24))
     draw = ImageDraw.Draw(img)
-    title = text[:120] or "Prévia"
+    title = text[:120] or "PrÃ©via"
     subtitle = "MoviePy Preview"
     try:
         font_big = ImageFont.truetype("arialbd.ttf", 72)
@@ -833,13 +1112,13 @@ def build_effects_preview(
     color_filter: Optional[str] = None,
     color_strength: Optional[float] = None,
     animation_type: Optional[str] = None,
-    caption_text: str = "Prévia de efeitos",
+    caption_text: str = "PrÃ©via de efeitos",
     duration: float = 3.5,
     ffmpeg_filters: Optional[str] = None,
 ) -> Path:
     """
-    Renderiza um MP4 curto para testar combinação de transição + filtro + animação.
-    Gera 2 cenas com imagens placeholder e áudio silencioso.
+    Renderiza um MP4 curto para testar combinaÃ§Ã£o de transiÃ§Ã£o + filtro + animaÃ§Ã£o.
+    Gera 2 cenas com imagens placeholder e Ã¡udio silencioso.
     """
     dur = max(1.5, min(8.0, float(duration)))
     builder = VideoBuilder(
@@ -858,8 +1137,8 @@ def build_effects_preview(
         caption_y_pct=config.CAPTION_Y_PCT,
     )
 
-    img1 = _make_placeholder_image(f"{caption_text} • Cena A", format_ratio)
-    img2 = _make_placeholder_image(f"{caption_text} • Cena B", format_ratio)
+    img1 = _make_placeholder_image(f"{caption_text} â€¢ Cena A", format_ratio)
+    img2 = _make_placeholder_image(f"{caption_text} â€¢ Cena B", format_ratio)
     aud1 = _make_silent_audio(dur)
     aud2 = _make_silent_audio(dur)
 
@@ -879,3 +1158,5 @@ def build_effects_preview(
         filtered = run_ffmpeg_filtergraph(output, ffmpeg_filters)
         return filtered or output
     return output
+
+

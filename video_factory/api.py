@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sys
 import asyncio
@@ -27,7 +27,7 @@ from video_factory.cleanup import purge_old_assets  # noqa: E402
 from video_factory.video_renderer import build_effects_preview  # noqa: E402
 from video_factory import config  # noqa: E402
 
-# cache de vozes disponíveis (pt-*)
+# cache de vozes disponÃ­veis (pt-*)
 VOICE_BY_ID: dict[str, dict[str, Any]] = {}
 VOICE_IDS: set[str] = set()
 
@@ -48,12 +48,18 @@ app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
 STATUS: Dict[str, Dict[str, Any]] = {}
 logger = logging.getLogger("video_factory.api")
 API_REVISION = "2026-02-17-audiofix-1"
-
+_STAGE_RANGES: Dict[str, tuple[float, float]] = {
+    "queued": (0.0, 0.02),
+    "tts": (0.02, 0.40),
+    "render": (0.40, 0.98),
+    "post": (0.98, 0.995),
+    "done": (1.0, 1.0),
+}
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """
-    Retorna detalhes claros quando o corpo recebido nÃ£o bate com RenderRequest.
+    Retorna detalhes claros quando o corpo recebido nÃƒÂ£o bate com RenderRequest.
     Ajuda a depurar erros 422 no frontend.
     """
     return JSONResponse(
@@ -109,8 +115,8 @@ async def _try_voices(text: str, voices: list[str]) -> tuple[bytes, str]:
 @app.get("/api/tts/preview")
 async def tts_preview(text: str = Query(..., min_length=1, max_length=300), voice: str | None = None):
     """
-    Prévia TTS usando ordem de providers definida em TTS_PROVIDER (edge,offline,...).
-    Não depende de listar vozes do Edge, funciona offline.
+    PrÃ©via TTS usando ordem de providers definida em TTS_PROVIDER (edge,offline,...).
+    NÃ£o depende de listar vozes do Edge, funciona offline.
     """
     try:
         audio_bytes, meta, ext = await synthesize_to_bytes_with_metadata(text, voice or EDGE_VOICE)
@@ -145,7 +151,7 @@ class PreviewRequest(BaseModel):
 @app.post("/api/render/preview")
 async def render_preview(body: PreviewRequest):
     """
-    Gera um MP4 curto (3-5s) para pré-visualizar efeitos sem rodar pipeline completo.
+    Gera um MP4 curto (3-5s) para prÃ©-visualizar efeitos sem rodar pipeline completo.
     """
     try:
         path = build_effects_preview(
@@ -154,7 +160,7 @@ async def render_preview(body: PreviewRequest):
             color_filter=body.filter,
             color_strength=body.colorStrength,
             animation_type=body.animationType,
-            caption_text=body.captionText or "Prévia de efeitos",
+            caption_text=body.captionText or "PrÃ©via de efeitos",
             duration=body.duration or 3.5,
             ffmpeg_filters=body.ffmpegFilters,
         )
@@ -172,6 +178,11 @@ def _set_status(task_id: str, **kwargs: Any) -> None:
     STATUS[task_id]["updated_at"] = asyncio.get_event_loop().time()
 
 
+def _map_stage_progress(stage: str, pct: float) -> float:
+    start, end = _STAGE_RANGES.get(stage, (0.0, 1.0))
+    pct = max(0.0, min(1.0, float(pct)))
+    return start + (end - start) * pct
+
 def _write_task_error_log(task_id: str, tb: str, err: str) -> Path:
     logs_dir = config.ASSETS_DIR / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -187,7 +198,7 @@ async def ping():
 @app.post("/api/cleanup")
 async def cleanup_cache(max_age_days: int | None = None):
     """
-    Limpa arquivos antigos de assets (imagens/áudios/vídeos/temp) baseado em max_age_days.
+    Limpa arquivos antigos de assets (imagens/Ã¡udios/vÃ­deos/temp) baseado em max_age_days.
     Default: config.CACHE_MAX_AGE_DAYS.
     """
     result = purge_old_assets(max_age_days)
@@ -206,14 +217,38 @@ def _path_to_web(path: Path | str | None) -> str | None:
 
 async def _run_render_task(task_id: str, request: RenderRequest) -> None:
     try:
-        _set_status(task_id, stage="queued", progress=0.0, message="Iniciando", done=False, error=None, output=None)
+        _set_status(
+            task_id,
+            stage="queued",
+            stage_progress=0.0,
+            progress=_map_stage_progress("queued", 0.0),
+            message="Iniciando",
+            done=False,
+            error=None,
+            output=None,
+        )
 
         def _progress(stage: str, pct: float, msg: str):
-            _set_status(task_id, stage=stage, progress=pct, message=msg)
+            _set_status(
+                task_id,
+                stage=stage,
+                stage_progress=max(0.0, min(1.0, float(pct))),
+                progress=_map_stage_progress(stage, pct),
+                message=msg,
+            )
 
         path = await render_script(request, progress_cb=_progress)
         web = _path_to_web(path)
-        _set_status(task_id, stage="done", progress=1.0, message="Concluído", done=True, output=str(path), web_url=web)
+        _set_status(
+            task_id,
+            stage="done",
+            stage_progress=1.0,
+            progress=1.0,
+            message="Concluido",
+            done=True,
+            output=str(path),
+            web_url=web,
+        )
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
         logger.exception("Render task %s falhou", task_id)
@@ -241,4 +276,38 @@ async def render_status(task_id: str):
     data = STATUS.get(task_id)
     if not data:
         raise HTTPException(status_code=404, detail="Task not found")
-    return data
+    payload = dict(data)
+
+    if not payload.get("done"):
+        now = asyncio.get_running_loop().time()
+        updated_at = payload.get("updated_at")
+        try:
+            stale_seconds = max(0.0, now - float(updated_at))
+        except Exception:
+            stale_seconds = 0.0
+        payload["stale_seconds"] = round(stale_seconds, 1)
+
+        stage = str(payload.get("stage") or "")
+        try:
+            stage_progress = float(payload.get("stage_progress") or 0.0)
+        except Exception:
+            stage_progress = 0.0
+        try:
+            current_progress = float(payload.get("progress") or 0.0)
+        except Exception:
+            current_progress = 0.0
+
+        if stage == "render" and stage_progress >= 0.995 and stale_seconds >= 8:
+            payload["stage"] = "finalizando"
+            payload["progress"] = max(current_progress, 0.985)
+            payload["message"] = "Finalizando arquivo de video..."
+        elif stale_seconds >= 12:
+            current_message = str(payload.get("message") or "").strip()
+            if current_message:
+                payload["message"] = f"{current_message} (aguarde, ainda processando)"
+            else:
+                payload["message"] = "Processando..."
+
+    return payload
+
+

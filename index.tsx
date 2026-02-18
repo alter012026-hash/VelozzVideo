@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+﻿import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 
 // --- Types ---
@@ -7,6 +7,8 @@ interface Scene {
   text: string;
   visualPrompt: string;
   localImage?: string;
+  localSfx?: string;
+  sfxVolume?: number;
   narrationAudio?: string; // Data URL MP3 (preview)
   status: 'pending' | 'processing' | 'completed';
   transition?: string;
@@ -77,6 +79,7 @@ interface SessionPayload {
   narrationVolume?: number;
   colorStrength?: number;
   transitionDuration?: number;
+  imageScale?: number;
   previewText?: string;
   previewTransition?: string;
   previewFilter?: string;
@@ -88,10 +91,78 @@ interface SessionPayload {
   canvasZoom?: number;
   openSections?: Partial<OpenSections>;
   gridFile?: string | null;
+  collapsedScenes?: Record<string, boolean>;
 }
 
 const SESSION_KEY = 'vv_session';
 const SESSION_PREV_KEY = 'vv_session_prev';
+const SESSION_DB_NAME = 'vv_session_db';
+const SESSION_DB_STORE = 'sessions';
+type SessionStoreKey = typeof SESSION_KEY | typeof SESSION_PREV_KEY;
+
+const hasIndexedDb = () => typeof window !== 'undefined' && typeof window.indexedDB !== 'undefined';
+
+const openSessionDb = (): Promise<IDBDatabase> =>
+  new Promise((resolve, reject) => {
+    if (!hasIndexedDb()) {
+      reject(new Error('IndexedDB indisponivel'));
+      return;
+    }
+    const req = window.indexedDB.open(SESSION_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(SESSION_DB_STORE)) {
+        db.createObjectStore(SESSION_DB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('Falha ao abrir IndexedDB'));
+  });
+
+const idbGetText = async (key: SessionStoreKey): Promise<string | null> => {
+  const db = await openSessionDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(SESSION_DB_STORE, 'readonly');
+      const store = tx.objectStore(SESSION_DB_STORE);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(typeof req.result === 'string' ? req.result : null);
+      req.onerror = () => reject(req.error || new Error('Falha ao ler IndexedDB'));
+    });
+  } finally {
+    db.close();
+  }
+};
+
+const idbSetText = async (key: SessionStoreKey, value: string): Promise<void> => {
+  const db = await openSessionDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SESSION_DB_STORE, 'readwrite');
+      const store = tx.objectStore(SESSION_DB_STORE);
+      const req = store.put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error || new Error('Falha ao gravar IndexedDB'));
+    });
+  } finally {
+    db.close();
+  }
+};
+
+const idbRemoveKey = async (key: SessionStoreKey): Promise<void> => {
+  const db = await openSessionDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SESSION_DB_STORE, 'readwrite');
+      const store = tx.objectStore(SESSION_DB_STORE);
+      const req = store.delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error || new Error('Falha ao remover chave no IndexedDB'));
+    });
+  } finally {
+    db.close();
+  }
+};
 
 const App: React.FC = () => {
   const [topic, setTopic] = useState('');
@@ -99,13 +170,13 @@ const App: React.FC = () => {
   const [currentStep, setCurrentStep] = useState<WorkflowStep>('topic');
   const stepOrder: WorkflowStep[] = ['topic', 'scripting', 'assets', 'rendering', 'done'];
   const transitionOptions = [
-    { id: 'fade', label: 'Fade in/out (padrão)' },
+    { id: 'fade', label: 'Fade in/out (padrao)' },
     { id: 'crossfade', label: 'Crossfade' },
     { id: 'slide_left', label: 'Slide Left' },
     { id: 'slide_right', label: 'Slide Right' },
     { id: 'slide_up', label: 'Slide Up' },
     { id: 'slide_down', label: 'Slide Down' },
-    { id: 'none', label: 'Sem transição' },
+    { id: 'none', label: 'Sem transicao' },
   ];
   const animationOptions = [
     { id: 'kenburns', label: 'Ken Burns' },
@@ -131,7 +202,7 @@ const App: React.FC = () => {
     { id: 'warm', label: 'Quente' },
     { id: 'bw', label: 'Preto e branco' },
     { id: 'vibrant', label: 'Vibrante' },
-    { id: 'vhs', label: 'VHS grão leve' },
+    { id: 'vhs', label: 'VHS grao leve' },
     { id: 'matte', label: 'Matte suave' },
   ];
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
@@ -170,6 +241,7 @@ const App: React.FC = () => {
   const [narrationVolume, setNarrationVolume] = useState<number>(1);
   const [colorStrength, setColorStrength] = useState<number>(0.35);
   const [transitionDuration, setTransitionDuration] = useState<number>(0.6);
+  const [imageScale, setImageScale] = useState<number>(1);
   const [previewTransition, setPreviewTransition] = useState<string>('crossfade');
   const [previewFilter, setPreviewFilter] = useState<string>('cinematic');
   const [previewAnimation, setPreviewAnimation] = useState<string>('kenburns');
@@ -208,6 +280,7 @@ const App: React.FC = () => {
   const maxScenes = videoLength === '1m' ? 6 : 20; // estimativa: ~10s/cena ou ~15s/cena
   const CARD_W = 288;
   const CARD_H = 340;
+  const CARD_H_COLLAPSED = 188;
   const GRID_COLS = 4;
   const GRID_GAP = 24;
   const CANVAS_PAD = 24;
@@ -219,6 +292,7 @@ const App: React.FC = () => {
     return Number.isFinite(v) && v >= 0.5 && v <= 1.6 ? v : 0.9;
   });
   const [scenePositions, setScenePositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [collapsedScenes, setCollapsedScenes] = useState<Record<string, boolean>>({});
   const [draggingSceneId, setDraggingSceneId] = useState<string | null>(null);
   const dragRef = useRef<{ id: string; startX: number; startY: number; origX: number; origY: number } | null>(null);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
@@ -242,7 +316,7 @@ const App: React.FC = () => {
       const portRange = Array.from({ length: 11 }, (_, i) => 8000 + i);
       const portCandidates = portRange.flatMap(p => [`http://127.0.0.1:${p}`, `http://localhost:${p}`]);
 
-      // Prioriza checar direto nos ports comuns antes de tentar o proxy do dev server, reduzindo erros ECONNREFUSED no console.
+      // Prioriza checar direto nos ports comuns antes de tentar o proxy do dev server.
       const rawCandidates = [
         envBase,
         saved,
@@ -274,8 +348,7 @@ const App: React.FC = () => {
             }
             if (!fallbackOkBase) fallbackOkBase = base;
           }
-        } catch (err) {
-          // Apenas segue para o próximo candidato; evita spam de erro
+        } catch {
           continue;
         }
       }
@@ -295,18 +368,18 @@ const App: React.FC = () => {
   }, []);
 
   const apiFetch = (path: string, options?: RequestInit) => {
-    if (!apiBase) throw new Error('API indisponível');
+    if (!apiBase) throw new Error('API indisponivel');
     return fetch(`${apiBase}${path}`, options);
   };
 
   const ensureApiOrWarn = () => {
     if (apiBase) return true;
     const now = Date.now();
-    // evita spam: só avisa a cada 2 minutos
+    // evita spam: so avisa a cada 2 minutos
     if (now - backendWarnRef.current > 120000) {
       backendWarnRef.current = now;
-      const hint = 'Backend não encontrado. Inicie: cd video_factory; .\\.venv\\Scripts\\Activate.ps1; uvicorn api:app --reload --port 8000 (ou use start_all.bat)';
-      setStatusMessage('API indisponível para requisições.');
+      const hint = 'Backend nao encontrado. Inicie: cd video_factory; .\\.venv\\Scripts\\Activate.ps1; uvicorn api:app --reload --port 8000 (ou use start_all.bat)';
+      setStatusMessage('API indisponivel para requisicoes.');
       pushLog(hint, 'warn');
     }
     return false;
@@ -326,16 +399,35 @@ const App: React.FC = () => {
     requestAnimationFrame(() => canvasScrollRef.current?.scrollTo({ left: 0, top: 0, behavior: 'smooth' }));
   };
 
+  const toggleSceneCollapse = (sceneId: string) => {
+    setCollapsedScenes(prev => ({ ...prev, [sceneId]: !prev[sceneId] }));
+  };
+
   const autoLayoutScenes = () => {
     if (!script) return;
     setScenePositions(() => {
       const next: Record<string, { x: number; y: number }> = {};
+      const rowHeights: number[] = [];
+
+      script.scenes.forEach((s, idx) => {
+        const row = Math.floor(idx / GRID_COLS);
+        const h = collapsedScenes[s.id] ? CARD_H_COLLAPSED : CARD_H;
+        rowHeights[row] = Math.max(rowHeights[row] || 0, h);
+      });
+
+      const rowOffsets: number[] = [];
+      let accY = CANVAS_PAD;
+      rowHeights.forEach((h, row) => {
+        rowOffsets[row] = accY;
+        accY += h + GRID_GAP;
+      });
+
       script.scenes.forEach((s, idx) => {
         const col = idx % GRID_COLS;
         const row = Math.floor(idx / GRID_COLS);
         next[s.id] = {
           x: CANVAS_PAD + col * (CARD_W + GRID_GAP),
-          y: CANVAS_PAD + row * (CARD_H + GRID_GAP),
+          y: rowOffsets[row] ?? CANVAS_PAD,
         };
       });
       return next;
@@ -346,7 +438,7 @@ const App: React.FC = () => {
   // --- General Settings ---
   const [settings, setSettings] = useState<GeneralSettings>({
     theme: 'Cinematographic',
-    backgroundMusic: 'Áudio Local',
+    backgroundMusic: 'Audio Local',
     voiceName: 'Kore',
     defaultTransition: 'fade',
     defaultFilter: 'cinematic',
@@ -354,7 +446,7 @@ const App: React.FC = () => {
 
   const sceneIdKey = script ? script.scenes.map(s => s.id).join('|') : '';
 
-const applySessionPayload = (payload: SessionPayload | null): boolean => {
+  const applySessionPayload = (payload: SessionPayload | null): boolean => {
     if (!payload) return false;
     setTopic(payload.topic ?? '');
     setFormat(payload.format ?? '16:9');
@@ -377,6 +469,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     if (payload.narrationVolume !== undefined) setNarrationVolume(Math.max(0, Number(payload.narrationVolume) || 0));
     if (payload.colorStrength !== undefined) setColorStrength(Math.max(0, Number(payload.colorStrength) || 0));
     if (payload.transitionDuration !== undefined) setTransitionDuration(Math.max(0.05, Number(payload.transitionDuration) || 0.6));
+    if (payload.imageScale !== undefined) setImageScale(Math.max(0.8, Math.min(1.2, Number(payload.imageScale) || 1)));
     if (payload.previewText !== undefined) setPreviewText(payload.previewText || '');
     if (payload.previewTransition) setPreviewTransition(payload.previewTransition);
     if (payload.previewFilter) setPreviewFilter(payload.previewFilter);
@@ -388,6 +481,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     if (payload.canvasZoom !== undefined) setCanvasZoom(clampZoom(Number(payload.canvasZoom) || 0.9));
     if (payload.openSections) setOpenSections(prev => ({ ...prev, ...payload.openSections }));
     setScenePositions(payload.scenePositions || {});
+    setCollapsedScenes(payload.collapsedScenes || {});
     setGridRows(payload.gridRows || 2);
     setGridCols(payload.gridCols || 3);
     setGridSceneTarget(payload.gridSceneTarget || null);
@@ -400,6 +494,8 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         status: s.status ?? 'completed',
         transition: s.transition || payload.settings?.defaultTransition || settings.defaultTransition || 'fade',
         filter: s.filter || payload.settings?.defaultFilter || settings.defaultFilter || 'none',
+        localSfx: typeof (s as any).localSfx === 'string' ? (s as any).localSfx : undefined,
+        sfxVolume: Math.max(0, Math.min(2, Number((s as any).sfxVolume) || 0.35)),
         flowTo: typeof s.flowTo === 'string' ? String(s.flowTo) : null,
       }));
       setScript({ ...payload.script, scenes: scenesWithStatus });
@@ -415,38 +511,78 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     return true;
   };
 
+  const loadSessionSerialized = async (key: SessionStoreKey): Promise<string | null> => {
+    if (hasIndexedDb()) {
+      try {
+        const fromDb = await idbGetText(key);
+        if (fromDb) {
+          try {
+            localStorage.setItem(key, fromDb);
+          } catch {
+            // ignore localStorage quota
+          }
+          return fromDb;
+        }
+      } catch {
+        // ignore IndexedDB read errors and fallback to localStorage
+      }
+    }
+    return localStorage.getItem(key);
+  };
+
   useEffect(() => {
     if (sessionBootRef.current) return;
     sessionBootRef.current = true;
-    const stored = localStorage.getItem(SESSION_KEY);
-    if (!stored) {
-      setIsSessionReady(true);
-      return;
-    }
-    try {
-      const payload = JSON.parse(stored) as SessionPayload;
-      if (applySessionPayload(payload)) {
-        pushLog('Sessão restaurada automaticamente', 'info');
+    let cancelled = false;
+    const boot = async () => {
+      const stored = await loadSessionSerialized(SESSION_KEY);
+      if (!stored) {
+        if (!cancelled) setIsSessionReady(true);
+        return;
       }
-    } catch (err: any) {
-      pushLog(`Falha ao restaurar sessão automática: ${err?.message || err}`, 'warn');
-    } finally {
-      setIsSessionReady(true);
-    }
+      try {
+        const payload = JSON.parse(stored) as SessionPayload;
+        if (!cancelled && applySessionPayload(payload)) {
+          pushLog('Sessao restaurada automaticamente', 'info');
+        }
+      } catch (err: any) {
+        if (!cancelled) pushLog(`Falha ao restaurar sessao automatica: ${err?.message || err}`, 'warn');
+      } finally {
+        if (!cancelled) setIsSessionReady(true);
+      }
+    };
+    void boot();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const persistSessionPayload = (payload: SessionPayload) => {
+    const serialized = JSON.stringify(payload);
     try {
-      const serialized = JSON.stringify(payload);
       const current = localStorage.getItem(SESSION_KEY);
-      if (current === serialized) return;
-      if (current) {
+      if (current && current !== serialized) {
         localStorage.setItem(SESSION_PREV_KEY, current);
       }
-      localStorage.setItem(SESSION_KEY, serialized);
+      if (current !== serialized) {
+        localStorage.setItem(SESSION_KEY, serialized);
+      }
     } catch {
-      // ignore quota issues
+      // ignore localStorage quota
     }
+    if (!hasIndexedDb()) return;
+    void (async () => {
+      try {
+        const current = await idbGetText(SESSION_KEY);
+        if (current === serialized) return;
+        if (current) {
+          await idbSetText(SESSION_PREV_KEY, current);
+        }
+        await idbSetText(SESSION_KEY, serialized);
+      } catch {
+        // ignore IndexedDB errors
+      }
+    })();
   };
 
   const canvasBounds = useMemo(() => {
@@ -455,13 +591,14 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     let maxY = 0;
     for (const s of script.scenes) {
       const pos = scenePositions[s.id] || { x: 0, y: 0 };
+      const cardH = collapsedScenes[s.id] ? CARD_H_COLLAPSED : CARD_H;
       if (pos.x > maxX) maxX = pos.x;
-      if (pos.y > maxY) maxY = pos.y;
+      if (pos.y + cardH > maxY) maxY = pos.y + cardH;
     }
     const w = Math.max(MIN_CANVAS_W, maxX + CARD_W + CANVAS_PAD);
-    const h = Math.max(MIN_CANVAS_H, maxY + CARD_H + CANVAS_PAD);
+    const h = Math.max(MIN_CANVAS_H, maxY + CANVAS_PAD);
     return { w, h };
-  }, [script, scenePositions]);
+  }, [script, scenePositions, collapsedScenes]);
 
   useEffect(() => {
     localStorage.setItem('vv_canvas_zoom', String(canvasZoom));
@@ -476,6 +613,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
   useEffect(() => {
     if (!script) {
       setScenePositions({});
+      setCollapsedScenes({});
       return;
     }
 
@@ -498,6 +636,20 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         };
       });
 
+      return next;
+    });
+  }, [sceneIdKey]);
+
+  useEffect(() => {
+    if (!script) {
+      setCollapsedScenes({});
+      return;
+    }
+    setCollapsedScenes(prev => {
+      const next: Record<string, boolean> = {};
+      for (const s of script.scenes) {
+        next[s.id] = !!prev[s.id];
+      }
       return next;
     });
   }, [sceneIdKey]);
@@ -540,6 +692,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       narrationVolume,
       colorStrength,
       transitionDuration,
+      imageScale,
       previewText,
       previewTransition,
       previewFilter,
@@ -551,6 +704,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       canvasZoom,
       openSections,
       gridFile,
+      collapsedScenes,
     };
     persistSessionPayload(payload);
   }, [
@@ -582,6 +736,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     narrationVolume,
     colorStrength,
     transitionDuration,
+    imageScale,
     previewText,
     previewTransition,
     previewFilter,
@@ -593,6 +748,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     canvasZoom,
     openSections,
     gridFile,
+    collapsedScenes,
   ]);
 
   const handleCanvasWheel = (e: React.WheelEvent<HTMLDivElement>) => {
@@ -638,8 +794,9 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     const newId = Math.random().toString(36).substr(2, 9);
     const newScene: Scene = {
       id: newId,
-      text: 'Nova narração',
-      visualPrompt: 'Nova descrição',
+      text: 'Nova narracao',
+      visualPrompt: 'Nova descricao',
+      sfxVolume: 0.35,
       status: 'completed',
       transition: settings.defaultTransition,
       filter: settings.defaultFilter,
@@ -844,7 +1001,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       const msg = err?.message || String(err);
       const isConn = /failed to fetch|network|ECONNREFUSED|API indisponível/i.test(msg);
       if (isConn) {
-        // já avisado por ensureApiOrWarn; não spammar
+        // ja avisado por ensureApiOrWarn; nao spammar
         setStatusMessage(prev => prev || 'Inicie o backend para habilitar prévia de voz.');
       } else {
         pushLog(`Falha na prévia de voz: ${msg}`, 'error');
@@ -916,7 +1073,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       const data = await res.json();
       const summary = `Removidos ${data.removed ?? '?'} | Mantidos ${data.kept ?? '?'} | Limite ${data.max_age_days ?? days}d`;
       setCleanupResult(summary);
-      pushLog(`Limpeza concluÃ­da: ${summary}`, 'info');
+      pushLog(`Limpeza concluída: ${summary}`, 'info');
     } catch (error: any) {
       handleAiError(error, 'Limpeza de cache');
     } finally {
@@ -924,8 +1081,8 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     }
   };
 
-  const restoreSession = () => {
-    const stored = localStorage.getItem(SESSION_KEY);
+  const restoreSession = async () => {
+    const stored = await loadSessionSerialized(SESSION_KEY);
     if (!stored) {
       pushLog('Nenhuma sessao salva', 'warn');
       return;
@@ -940,8 +1097,8 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     }
   };
 
-  const restorePreviousSession = () => {
-    const stored = localStorage.getItem(SESSION_PREV_KEY);
+  const restorePreviousSession = async () => {
+    const stored = await loadSessionSerialized(SESSION_PREV_KEY);
     if (!stored) {
       pushLog('Nenhuma sessao anterior salva', 'warn');
       return;
@@ -956,31 +1113,206 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     }
   };
 
+  const buildSceneVisualPrompt = (sceneText: string, sceneIndex: number): string => {
+    const cleanText = String(sceneText || '').replace(/\s+/g, ' ').trim();
+    const narrative = cleanText || `CENA ${sceneIndex + 1}`;
+    return `Ilustracao cinematografica (${settings.theme}) da cena ${sceneIndex + 1}: ${narrative}. Composicao detalhada, iluminacao dramatica, profundidade de campo, enquadramento claro, atmosfera coerente com o roteiro, sem texto na imagem, alta qualidade.`;
+  };
+
+  const buildSceneVisualPromptEn = (sceneText: string, sceneIndex: number): string => {
+    const cleanText = String(sceneText || '').replace(/\s+/g, ' ').trim();
+    const narrative = cleanText || `SCENE ${sceneIndex + 1}`;
+    return `Cinematic illustration (${settings.theme}) for scene ${sceneIndex + 1}: ${narrative}. Detailed composition, dramatic lighting, depth of field, clear framing, mood consistent with the storyline, no text in image, high quality.`;
+  };
+
+  const getFormatGuide = (value: '16:9' | '9:16') => (
+    value === '9:16'
+      ? { target: '1080x1920', max: '2160x3840' }
+      : { target: '1920x1080', max: '3840x2160' }
+  );
+
+  const buildAllScenePromptsText = (lang: 'pt' | 'en' = 'pt') => {
+    if (!script?.scenes?.length) return '';
+    const guide = getFormatGuide(format);
+    const projectTitle = String(script.title || '').trim() || 'Projeto sem titulo';
+    const projectTopic = String(topic || '').trim() || projectTitle;
+    const style = String(settings.theme || '').trim() || 'Cinematographic';
+
+    const lines: string[] = lang === 'en'
+      ? [
+          `PROJECT: ${projectTitle}`,
+          `TOPIC: ${projectTopic}`,
+          `GLOBAL STYLE: ${style}`,
+          `FINAL VIDEO FORMAT: ${format} (${guide.target})`,
+          `MAX RECOMMENDED RESOLUTION: ${guide.max}`,
+          '',
+          'GENERAL IMAGE GENERATION INSTRUCTIONS:',
+          `- Keep ${format} aspect ratio for every image.`,
+          '- No text, no logos, no watermark, no borders.',
+          '- Cinematic visual language, rich details, clear subject and depth.',
+          '- Keep visual consistency across scenes (palette, style and lighting).',
+          '- Export as high-quality PNG or JPG.',
+          '',
+          'SCENE PROMPTS:',
+          '',
+        ]
+      : [
+          `PROJETO: ${projectTitle}`,
+          `TEMA: ${projectTopic}`,
+          `ESTILO GLOBAL: ${style}`,
+          `FORMATO FINAL DE VIDEO: ${format} (${guide.target})`,
+          `RESOLUCAO MAXIMA RECOMENDADA: ${guide.max}`,
+          '',
+          'INSTRUCOES GERAIS PARA GERAR AS IMAGENS:',
+          `- Manter proporcao ${format} em todas as imagens.`,
+          '- Sem texto, sem logos, sem watermark e sem bordas.',
+          '- Linguagem cinematografica, alto nivel de detalhe e boa profundidade.',
+          '- Manter consistencia visual entre as cenas (paleta, estilo e iluminacao).',
+          '- Exportar em PNG ou JPG de alta qualidade.',
+          '',
+          'PROMPTS POR CENA:',
+          '',
+        ];
+
+    script.scenes.forEach((scene, idx) => {
+      const prompt = lang === 'en'
+        ? buildSceneVisualPromptEn(scene.text, idx)
+        : (String(scene.visualPrompt || '').trim() || buildSceneVisualPrompt(scene.text, idx));
+      lines.push(lang === 'en' ? `SCENE ${idx + 1}:` : `CENA ${idx + 1}:`);
+      lines.push(prompt);
+      lines.push('');
+    });
+
+    return lines.join('\n');
+  };
+
   const generateScript = async () => {
     if (!topic.trim()) return;
     setIsGeneratingScript(true);
     setCurrentStep('scripting');
-    setStatusMessage('IA Projetando Roteiro e Sincronizando Assets...');
-    pushLog('Iniciando geração de roteiro', 'info');
+    setStatusMessage('IA projetando roteiro...');
+    pushLog('Iniciando geracao de roteiro', 'info');
 
-    const prompt = `Crie um roteiro de vídeo sobre "${topic}". 
-    O tema visual geral é "${settings.theme}".
-    Retorne JSON com "title" e array "scenes" (id, text, visualPrompt). Máximo ${maxScenes} cenas.`;
+    const normalizeSceneText = (value: string) =>
+      String(value || '')
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const tokenSet = (value: string) =>
+      new Set(
+        normalizeSceneText(value)
+          .split(' ')
+          .filter((t) => t.length > 2)
+      );
+
+    const jaccard = (a: Set<string>, b: Set<string>) => {
+      if (!a.size || !b.size) return 0;
+      let inter = 0;
+      for (const item of a) {
+        if (b.has(item)) inter += 1;
+      }
+      return inter / (a.size + b.size - inter);
+    };
+
+    const hasLowDiversity = (scenes: Array<{ text?: string; visualPrompt?: string }>) => {
+      if (!scenes || scenes.length < 2) return false;
+      const texts = scenes.map((s) => normalizeSceneText(s.text || ''));
+      const visuals = scenes.map((s) => normalizeSceneText(s.visualPrompt || ''));
+      const uniqueTexts = new Set(texts.filter(Boolean)).size;
+      const uniqueVisuals = new Set(visuals.filter(Boolean)).size;
+
+      if (uniqueTexts / scenes.length < 0.75) return true;
+      if (uniqueVisuals / scenes.length < 0.75) return true;
+
+      for (let i = 0; i < scenes.length; i += 1) {
+        for (let j = i + 1; j < scenes.length; j += 1) {
+          const textSim = jaccard(tokenSet(scenes[i].text || ''), tokenSet(scenes[j].text || ''));
+          const visualSim = jaccard(tokenSet(scenes[i].visualPrompt || ''), tokenSet(scenes[j].visualPrompt || ''));
+          if (textSim > 0.72 || visualSim > 0.72) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    const buildPrompt = (attempt: number) => `Voce e um roteirista criativo para videos curtos.
+Tema central: "${topic}".
+Direcao visual global: "${settings.theme}".
+
+Objetivo:
+- Criar no maximo ${maxScenes} cenas.
+- Cada cena deve trazer uma ideia nova, sem copiar texto de outras cenas.
+- Nao repetir a mesma frase-base em todas as cenas.
+- Narrativa com progressao: abertura -> desenvolvimento -> virada -> fechamento.
+- Variar cenario, foco, angulo e detalhe visual entre cenas.
+- Evitar texto generico e evitar repeticao literal do tema.
+
+Regras de saida (obrigatorio):
+- Responda SOMENTE JSON valido.
+- Estrutura: {"title":"...","scenes":[{"id":"1","text":"...","visualPrompt":"..."}]}.
+- "text" deve ser narracao da cena.
+- "visualPrompt" deve descrever imagem/video da cena com detalhes diferentes das outras.
+- Nao inclua markdown, comentarios ou texto fora do JSON.
+${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ainda mais a variedade entre cenas.' : ''}`;
 
     try {
       localStorage.setItem('ollama_host', ollamaHost);
       localStorage.setItem('ollama_model', ollamaModel);
-      const response = await fetch(`${ollamaHost.replace(/\/$/, '')}/api/generate`, {
-        method: 'POST',
-        body: JSON.stringify({ model: ollamaModel, prompt: `${prompt}. Responda apenas com o JSON puro.`, stream: false, format: 'json' }),
-      });
-      const resData = await response.json();
-      const data = JSON.parse(String(resData.response));
-      
+
+      let data: any = null;
+      let lastError: any = null;
+
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const response = await fetch(`${ollamaHost.replace(/\/$/, '')}/api/generate`, {
+          method: 'POST',
+          body: JSON.stringify({
+            model: ollamaModel,
+            prompt: buildPrompt(attempt),
+            stream: false,
+            format: 'json',
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Ollama HTTP ${response.status}`);
+        }
+
+        const resData = await response.json();
+        const parsed = JSON.parse(String(resData.response || '{}'));
+        if (!parsed?.title || !Array.isArray(parsed?.scenes) || parsed.scenes.length === 0) {
+          lastError = new Error('Resposta sem formato de roteiro valido');
+          continue;
+        }
+
+        const candidateScenes = parsed.scenes.slice(0, maxScenes).map((s: any, idx: number) => ({
+          id: String(s.id ?? idx + 1),
+          text: String(s.text || '').trim(),
+          visualPrompt: String(s.visualPrompt || '').trim() || buildSceneVisualPrompt(String(s.text || ''), idx),
+        }));
+
+        if (hasLowDiversity(candidateScenes)) {
+          lastError = new Error('Roteiro repetitivo');
+          pushLog(`Roteiro repetitivo detectado (tentativa ${attempt}/3), regenerando...`, 'warn');
+          continue;
+        }
+
+        data = { ...parsed, scenes: candidateScenes };
+        break;
+      }
+
+      if (!data) {
+        throw lastError || new Error('Nao foi possivel gerar roteiro criativo');
+      }
+
       const scenesWithStatus = data.scenes.map((s: any, idx: number) => ({
         ...s,
         id: String(s.id ?? idx + 1),
         status: 'completed',
+        localSfx: typeof s.localSfx === 'string' ? s.localSfx : undefined,
+        sfxVolume: Math.max(0, Math.min(2, Number(s.sfxVolume) || 0.35)),
         transition: settings.defaultTransition,
         filter: settings.defaultFilter,
         flowTo: s.flowTo ? String(s.flowTo) : null,
@@ -996,7 +1328,6 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       setStatusMessage('');
     }
   };
-
   const blobToDataUrl = (blob: Blob): Promise<string> =>
     new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -1028,9 +1359,9 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       const blob = await res.blob();
       const dataUrl = await blobToDataUrl(blob);
       updateScene(sceneId, { narrationAudio: dataUrl });
-      pushLog(`Narração gerada para cena ${sceneId}`, 'info');
+      pushLog(`Narracao gerada para cena ${sceneId}`, 'info');
     } catch (error: any) {
-      handleAiError(error, 'Narração');
+      handleAiError(error, 'Narracao');
     } finally {
       setIsGeneratingNarration(null);
     }
@@ -1095,12 +1426,14 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     });
   };
 
-  const handleFileUpload = (type: 'scene_image' | 'global_theme' | 'global_music', id: string, file: File) => {
+  const handleFileUpload = (type: 'scene_image' | 'scene_sfx' | 'global_theme' | 'global_music', id: string, file: File) => {
     const reader = new FileReader();
     reader.onloadend = () => {
       const result = reader.result as string;
       if (type === 'scene_image') {
         updateScene(id, { localImage: result });
+      } else if (type === 'scene_sfx') {
+        updateScene(id, { localSfx: result, sfxVolume: 0.35 });
       } else if (type === 'global_theme') {
         setSettings({ ...settings, localThemeRef: result });
       } else if (type === 'global_music') {
@@ -1124,6 +1457,64 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       pushLog(`Falha ao carregar grade: ${err}`,'error');
     };
     reader.readAsDataURL(file);
+  };
+
+  const copyScenePrompt = async (scene: Scene, sceneIndex: number) => {
+    if (!navigator.clipboard) {
+      pushLog('Clipboard indisponivel', 'warn');
+      return;
+    }
+    try {
+      const prompt = String(scene.visualPrompt || '').trim() || buildSceneVisualPrompt(scene.text, sceneIndex);
+      await navigator.clipboard.writeText(prompt);
+      pushLog(`Prompt da cena ${sceneIndex + 1} copiado`, 'info');
+    } catch (err: any) {
+      pushLog(`Erro ao copiar prompt: ${err?.message || err}`, 'error');
+    }
+  };
+
+  const copyAllScenePrompts = async () => {
+    if (!script?.scenes?.length) {
+      pushLog('Nao ha cenas para copiar', 'warn');
+      return;
+    }
+    if (!navigator.clipboard) {
+      pushLog('Clipboard indisponivel', 'warn');
+      return;
+    }
+    try {
+      const compiled = buildAllScenePromptsText('pt');
+      if (!compiled) {
+        pushLog('Nao foi possivel montar o texto dos prompts', 'warn');
+        return;
+      }
+      await navigator.clipboard.writeText(compiled);
+      pushLog(`Prompts de ${script.scenes.length} cenas copiados com instrucoes`, 'info');
+    } catch (err: any) {
+      pushLog(`Erro ao copiar prompts: ${err?.message || err}`, 'error');
+    }
+  };
+
+  const copyAllScenePromptsEn = async () => {
+    if (!script?.scenes?.length) {
+      pushLog('Nao ha cenas para copiar', 'warn');
+      return;
+    }
+    if (!navigator.clipboard) {
+      pushLog('Clipboard indisponivel', 'warn');
+      return;
+    }
+    try {
+      const compiled = buildAllScenePromptsText('en');
+      if (!compiled) {
+        pushLog('Nao foi possivel montar o texto dos prompts', 'warn');
+        return;
+      }
+      await navigator.clipboard.writeText(compiled);
+      pushLog(`Prompts EN de ${script.scenes.length} cenas copiados`, 'info');
+    } catch (err: any) {
+      pushLog(`Erro ao copiar prompts EN: ${err?.message || err}`, 'error');
+    }
   };
 
   const copyTileAsBase64 = async (tile: GridTile) => {
@@ -1154,9 +1545,12 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
       try {
         const json = JSON.parse(String(reader.result || '{}'));
         if (!json?.title || !Array.isArray(json?.scenes)) throw new Error('Formato inválido');
-        const scenesWithStatus = json.scenes.map((s: any) => ({
+        const scenesWithStatus = json.scenes.map((s: any, idx: number) => ({
           ...s,
           status: s.status ?? 'completed',
+          visualPrompt: String(s.visualPrompt || '').trim() || buildSceneVisualPrompt(String(s.text || ''), idx),
+          localSfx: typeof s.localSfx === 'string' ? s.localSfx : undefined,
+          sfxVolume: Math.max(0, Math.min(2, Number(s.sfxVolume) || 0.35)),
           transition: s.transition || settings.defaultTransition,
           filter: s.filter || settings.defaultFilter,
           flowTo: typeof s.flowTo === 'string' ? s.flowTo : null,
@@ -1191,13 +1585,17 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     setScenePositions({});
     localStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(SESSION_PREV_KEY);
+    if (hasIndexedDb()) {
+      void idbRemoveKey(SESSION_KEY);
+      void idbRemoveKey(SESSION_PREV_KEY);
+    }
   };
 
   const generateFullVideo = async () => {
     if (!script) return;
     if (!apiBase) {
       setStatusMessage('API indisponível para render. Inicie o backend: "cd video_factory; .\\.venv\\Scripts\\Activate.ps1; uvicorn api:app --reload --port 8000".');
-      pushLog('Backend não encontrado. Inicie uvicorn em 127.0.0.1:8000 (ou 8001+) e recarregue.', 'error');
+      pushLog('Backend nao encontrado. Inicie uvicorn em 127.0.0.1:8000 (ou 8001+) e recarregue.', 'error');
       return;
     }
 
@@ -1208,7 +1606,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
     setStatusMessage('Iniciando render com motor local...');
 
     try {
-      const hasLocalAssets = script.scenes.some(s => s.localImage) || settings.localThemeRef || settings.localBackgroundMusic;
+      const hasLocalAssets = script.scenes.some(s => s.localImage || s.localSfx) || settings.localThemeRef || settings.localBackgroundMusic;
 
       if (!hasLocalAssets) {
         setStatusMessage('Adicione imagens ou áudio local antes de processar. O motor local precisa de assets locais para criar o vídeo.');
@@ -1223,6 +1621,8 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
           text: s.text,
           visualPrompt: s.visualPrompt,
           localImage: s.localImage,
+          localSfx: s.localSfx,
+          sfxVolume: s.sfxVolume ?? 0.35,
           animationType: (s as any).animationType,
           transition: s.transition || settings.defaultTransition,
           filter: s.filter || settings.defaultFilter,
@@ -1239,6 +1639,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         narrationVolume,
         colorStrength,
         transitionDuration,
+        imageScale,
         captionFontScale: captionScale,
         captionBgOpacity: captionBg,
         captionColor,
@@ -1270,9 +1671,20 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         const stRes = await apiFetch(`/api/render/status/${task_id}`);
         if (!stRes.ok) throw new Error(`Falha ao consultar status: HTTP ${stRes.status}`);
         const st = await stRes.json();
-        setRenderStage(st.stage || '');
-        setRenderProgress(Math.round((st.progress || 0) * 100));
-        setStatusMessage(st.message || '');
+        const stageLabel = st.stage || '';
+        const staleSeconds = Number(st.stale_seconds || 0);
+        const backendPct = Math.max(0, Math.min(100, Number(st.progress || 0) * 100));
+        const syntheticPct = stageLabel === 'finalizando'
+          ? Math.min(99.9, Math.max(backendPct, 98.5 + Math.min(staleSeconds, 120) * 0.012))
+          : backendPct;
+        const fallbackMsg = stageLabel === 'finalizando'
+          ? 'Finalizando arquivo de vídeo. Esta etapa pode levar alguns minutos.'
+          : staleSeconds >= 12
+            ? 'Processando...'
+            : '';
+        setRenderStage(stageLabel);
+        setRenderProgress(syntheticPct);
+        setStatusMessage(st.message || fallbackMsg);
         if (st.done) {
           done = true;
           if (st.error) {
@@ -1291,7 +1703,8 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
           pushLog(`Render concluído: ${finalUrl || rawUrl || st.output}`, 'info');
           setCurrentStep('done');
         } else {
-          await new Promise(r => setTimeout(r, 1500));
+          const pollDelayMs = staleSeconds >= 20 ? 3000 : 1500;
+          await new Promise(r => setTimeout(r, pollDelayMs));
         }
       }
     } catch (error: any) {
@@ -1309,7 +1722,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
   const testRenderPipeline = async () => {
     if (isGeneratingVideo || isTestingRender) return;
     setIsTestingRender(true);
-    setStatusMessage('Testando pipeline local com payload padrão...');
+    setStatusMessage('Testando pipeline local com payload padrao...');
     try {
       const testRequest = {
         scenes: [
@@ -1323,6 +1736,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
         narrationVolume,
         colorStrength,
         transitionDuration,
+        imageScale,
         captionFontScale: captionScale,
         captionBgOpacity: captionBg,
         captionColor,
@@ -1356,6 +1770,9 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
   };
 
   const progress = ((stepOrder.indexOf(currentStep) + 1) / stepOrder.length) * 100;
+  const renderProgressLabel = (renderStage || '').toLowerCase() === 'finalizando'
+    ? renderProgress.toFixed(1)
+    : renderProgress.toFixed(0);
 
   return (
     <div className="min-h-screen bg-[#020617] selection:bg-blue-500/30">
@@ -1369,15 +1786,15 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                 <p className="text-gray-500 text-[11px] font-bold uppercase tracking-[0.18em]">Fluxo Local + API</p>
               </div>
               <div className="grid grid-cols-3 gap-2">
-                <button onClick={restoreSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all leading-tight text-center">Recuperar sess�o</button>
-                <button onClick={restorePreviousSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-amber-500/40 text-amber-300 hover:text-white hover:border-amber-400 transition-all leading-tight text-center">Sess�o anterior</button>
+                <button onClick={restoreSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all leading-tight text-center">Recuperar sessao</button>
+                <button onClick={restorePreviousSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-amber-500/40 text-amber-300 hover:text-white hover:border-amber-400 transition-all leading-tight text-center">Sessao anterior</button>
                 <button onClick={resetProject} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-red-500/40 text-red-300 hover:text-white hover:border-red-400 transition-all leading-tight text-center">Resetar</button>
               </div>
             </div>
             <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] text-gray-400"> 
               <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Etapa: <span className="text-white">{currentStep}</span></div>
               <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Form.: {format}</div>
-              <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Duração: {videoLength === '1m' ? '1m' : '5m'}</div>
+              <div className="px-2 py-1 rounded-lg bg-black/40 border border-gray-800">Duracao: {videoLength === '1m' ? '1m' : '5m'}</div>
             </div>
             <div className="mt-3 h-2 w-full bg-gray-900 rounded-full overflow-hidden">
               <div className="h-full bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500" style={{ width: `${progress}%` }}></div>
@@ -1387,7 +1804,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
           <div className="glass p-5 rounded-3xl border-blue-500/15 flex flex-col gap-3 shadow-2xl">
             <div className="flex items-center justify-between">
               <span className="text-[10px] font-black uppercase tracking-[0.2em] text-blue-400">Status de Producao</span>
-              <span className="text-[10px] font-mono text-gray-400">{Math.max(0, renderProgress).toFixed(0)}%</span>
+              <span className="text-[10px] font-mono text-gray-400">{renderProgressLabel}%</span>
             </div>
             <div className="h-2 w-full bg-gray-900 rounded-full overflow-hidden">
               <div className="h-full bg-gradient-to-r from-blue-500 via-cyan-400 to-emerald-400 transition-all duration-300" style={{ width: `${Math.max(0, Math.min(100, renderProgress))}%` }}></div>
@@ -1416,6 +1833,132 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
               </div>
             )}
           </div>
+
+          {script && (
+            <div className="glass p-5 rounded-3xl border-blue-500/10 flex flex-col gap-4 shadow-2xl">
+              <h3 className="font-black text-xs text-blue-500 uppercase tracking-[0.3em]">Painel de Render</h3>
+
+              <div className="pt-1 text-[11px] space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-gray-500 font-mono">Roteiro</span>
+                  <div className="flex gap-2">
+                    <label className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 cursor-pointer hover:border-blue-500/50 transition-all">
+                      Importar
+                      <input type="file" accept="application/json" className="hidden" onChange={(e) => e.target.files?.[0] && handleImportScript(e.target.files[0])} />
+                    </label>
+                    <button onClick={downloadScript} disabled={!script} className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-40 transition-all">Exportar</button>
+                  </div>
+                </div>
+                {importError && <p className="text-xs text-red-400">{importError}</p>}
+              </div>
+
+              <div className="pt-3 border-t border-gray-800 text-[11px] space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-gray-500 font-mono">Limpar cache</span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      className="w-16 bg-black/40 border border-gray-800 rounded-lg px-2 py-1 text-[10px] text-white outline-none focus:border-blue-500/40"
+                      value={cleanupAgeDays}
+                      onChange={(e) => setCleanupAgeDays(Math.max(1, Number(e.target.value) || 7))}
+                      title="Dias maximos para manter assets"
+                    />
+                    <button
+                      onClick={cleanupCache}
+                      disabled={isCleaningCache}
+                      className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-50 transition-all"
+                    >
+                      {isCleaningCache ? 'Limpando...' : 'Executar'}
+                    </button>
+                  </div>
+                </div>
+                {cleanupResult && <p className="text-[10px] text-green-300">{cleanupResult}</p>}
+              </div>
+
+              <div className="pt-3 border-t border-gray-800 text-[11px] space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <span className="text-gray-500 font-mono">Volumes</span>
+                  <div className="flex-1 grid grid-cols-2 gap-3">
+                    <label className="flex flex-col gap-1 text-[10px] text-gray-400">
+                      Musica {Math.round(musicVolume * 100)}%
+                      <input type="range" min={0} max={1} step={0.05} value={musicVolume} onChange={(e)=>setMusicVolume(Number(e.target.value))} />
+                    </label>
+                    <label className="flex flex-col gap-1 text-[10px] text-gray-400">
+                      Narracao {Math.round(narrationVolume * 100)}%
+                      <input type="range" min={0.3} max={1.5} step={0.05} value={narrationVolume} onChange={(e)=>setNarrationVolume(Number(e.target.value))} />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="flex items-start justify-between gap-3">
+                  <span className="text-gray-500 font-mono">Legendas</span>
+                  <div className="flex-1 space-y-2">
+                    <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-400">
+                      <label className="flex flex-col gap-1">
+                        Tamanho {captionScale.toFixed(2)}x
+                        <input type="range" min={0.7} max={1.4} step={0.05} value={captionScale} onChange={(e)=>setCaptionScale(Number(e.target.value))} />
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        Opacidade BG {Math.round(captionBg*100)}%
+                        <input type="range" min={0} max={1} step={0.05} value={captionBg} onChange={(e)=>setCaptionBg(Number(e.target.value))} />
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        Posicao Y {captionY}%
+                        <input type="range" min={60} max={90} step={1} value={captionY} onChange={(e)=>setCaptionY(Number(e.target.value))} />
+                      </label>
+                    </div>
+                    <div className="flex items-center gap-3 text-[10px] text-gray-300">
+                      <span>Cor</span>
+                      <input type="color" value={captionColor} onChange={(e)=>setCaptionColor(e.target.value)} />
+                      <span>Destaque</span>
+                      <input type="color" value={captionHighlight} onChange={(e)=>setCaptionHighlight(e.target.value)} />
+                    </div>
+                    <div className="mt-1 p-3 rounded-xl border border-gray-800 bg-black/40 text-center text-[11px]">
+                      <span style={{backgroundColor:`rgba(0,0,0,${captionBg})`, padding:'6px 10px', borderRadius:'10px', display:'inline-block', color: captionColor}}>
+                        LEGENDAS PREVIA <span style={{color: captionHighlight}}>DESTAQUE</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-start justify-between gap-3">
+                  <span className="text-gray-500 font-mono">Efeitos</span>
+                  <div className="flex-1 grid grid-cols-2 gap-3 text-[10px] text-gray-400">
+                    <label className="flex flex-col gap-1">
+                      Forca de cor {colorStrength.toFixed(2)}
+                      <input type="range" min={0} max={1.2} step={0.05} value={colorStrength} onChange={(e)=>setColorStrength(Number(e.target.value))} />
+                    </label>
+                    <label className="flex flex-col gap-1">
+                      Duracao de transicao {transitionDuration.toFixed(2)}s
+                      <input type="range" min={0.2} max={1.2} step={0.05} value={transitionDuration} onChange={(e)=>setTransitionDuration(Number(e.target.value))} />
+                    </label>
+                    <label className="flex flex-col gap-1 col-span-2">
+                      Escala da imagem {imageScale.toFixed(2)}x
+                      <input type="range" min={0.8} max={1.2} step={0.02} value={imageScale} onChange={(e)=>setImageScale(Number(e.target.value))} />
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-gray-800">
+                <button
+                  onClick={generateFullVideo}
+                  disabled={isGeneratingVideo}
+                  className="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all active:scale-[0.98] shadow-xl shadow-blue-900/30 disabled:opacity-50"
+                >
+                  {isGeneratingVideo ? <Loader /> : "Processar Projeto"}
+                </button>
+                <button
+                  onClick={testRenderPipeline}
+                  disabled={isGeneratingVideo || isTestingRender}
+                  className="w-full mt-3 border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 px-4 py-3 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all disabled:opacity-50"
+                >
+                  {isTestingRender ? <Loader /> : "Forcar teste (ver logs)"}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Roteiro Local */}
           <div className="glass p-5 rounded-3xl flex flex-col gap-3 border-white/5 relative overflow-hidden">
@@ -1503,7 +2046,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
             </div>
             {openSections.effects && (
               <>
-                <label className="text-[10px] text-gray-500 uppercase font-bold">Transição padrão</label>
+                <label className="text-[10px] text-gray-500 uppercase font-bold">Transicao padrao</label>
                 <select
                   value={settings.defaultTransition || 'fade'}
                   onChange={(e) => setSettings({ ...settings, defaultTransition: e.target.value })}
@@ -1544,13 +2087,13 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Transição</label>
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Transicao</label>
                       <select value={previewTransition} onChange={e => setPreviewTransition(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
                         {transitionOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
                       </select>
                     </div>
                     <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Animação</label>
+                      <label className="text-[10px] text-gray-500 uppercase font-bold">Animacao</label>
                       <select value={previewAnimation} onChange={e => setPreviewAnimation(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
                         {animationOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
                       </select>
@@ -1574,7 +2117,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                     <button onClick={previewVideoEffects} disabled={isPreviewRendering} className="px-3 py-2 rounded-xl bg-cyan-600/80 hover:bg-cyan-500 text-white text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
                       {isPreviewRendering ? 'Gerando...' : 'Gerar prévia'}
                     </button>
-                    <span className="text-[10px] text-gray-400">MP4 de 3-4s para validar transição + filtro + animação + FFmpeg.</span>
+                    <span className="text-[10px] text-gray-400">MP4 de 3-4s para validar transicao + filtro + animacao + FFmpeg.</span>
                   </div>
                   {previewUrl && (
                     <div className="mt-3 rounded-xl overflow-hidden border border-cyan-500/30 bg-black/40 p-2">
@@ -1587,10 +2130,10 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
             )}
           </div>
 
-          {/* Edição avançada (FFmpeg / Estabilização) */}
+          {/* Edicao avancada (FFmpeg / Estabilizacao) */}
           <div className="glass p-5 rounded-3xl flex flex-col gap-4 border-emerald-500/10 relative overflow-hidden">
             <div className="flex items-center justify-between">
-              <p className="text-[11px] font-black uppercase text-emerald-300">Edição avançada (pós)</p>
+              <p className="text-[11px] font-black uppercase text-emerald-300">Edicao avancada (pos)</p>
               <button onClick={() => toggleSection('advanced')} className="text-[11px] text-gray-400 hover:text-white">{openSections.advanced ? '−' : '+'}</button>
             </div>
             {openSections.advanced && (
@@ -1609,12 +2152,12 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                   <div className="flex flex-col gap-1">
                     <label className="text-[10px] text-gray-500 uppercase font-bold">Motor</label>
                     <select value={engine} onChange={e => setEngine(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-emerald-400/70 transition-all">
-                      <option value="moviepy">MoviePy (padrão)</option>
+                      <option value="moviepy">MoviePy (padrao)</option>
                       <option value="movielite">MovieLite (experimental)</option>
                     </select>
                   </div>
                   <div className="text-[10px] text-gray-400 bg-black/30 border border-gray-800 rounded-xl p-2 leading-relaxed">
-                    Os filtros FFmpeg serão aplicados após a montagem. Se ffmpeg não estiver instalado, o render segue sem erro.
+                    Os filtros FFmpeg serao aplicados apos a montagem. Se ffmpeg nao estiver instalado, o render segue sem erro.
                   </div>
                 </div>
               </>
@@ -1638,7 +2181,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
             {openSections.audio && (
               <>
                 <div className="text-[11px] text-gray-400 relative z-10 leading-relaxed">
-                  Arraste ou clique para definir a trilha. Fontes online estão desativadas para priorizar conteúdo local e seguro.
+                  Arraste ou clique para definir a trilha. Fontes online estao desativadas para priorizar conteudo local e seguro.
                 </div>
                 {settings.localBackgroundMusic ? (
                   <div className="flex items-center gap-2 px-3 py-2 bg-purple-500/15 rounded-xl border border-purple-500/30 relative z-10">
@@ -1798,6 +2341,20 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                 <span className="text-[10px] font-mono text-gray-500 w-14 text-right">{Math.round(canvasZoom * 100)}%</span>
                 <button onClick={autoLayoutScenes} disabled={!script} className="px-3 py-2 rounded-xl border border-gray-800 bg-black/40 text-gray-300 hover:text-white hover:border-blue-500/40 transition-all disabled:opacity-40">Auto</button>
                 <button onClick={resetCanvasView} className="px-3 py-2 rounded-xl border border-gray-800 bg-black/40 text-gray-300 hover:text-white hover:border-blue-500/40 transition-all">Reset</button>
+                <button
+                  onClick={copyAllScenePrompts}
+                  disabled={!script || script.scenes.length === 0}
+                  className="px-3 py-2 rounded-xl border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:text-white hover:border-cyan-300 transition-all disabled:opacity-40"
+                >
+                  Copiar prompts
+                </button>
+                <button
+                  onClick={copyAllScenePromptsEn}
+                  disabled={!script || script.scenes.length === 0}
+                  className="px-3 py-2 rounded-xl border border-indigo-500/40 bg-indigo-500/10 text-indigo-200 hover:text-white hover:border-indigo-300 transition-all disabled:opacity-40"
+                >
+                  Copy prompts EN
+                </button>
                 <button onClick={addSceneCard} disabled={!script || script.scenes.length >= maxScenes} className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-black uppercase tracking-[0.18em] transition-all disabled:opacity-40">+ Card</button>
               </div>
             </div>
@@ -1827,10 +2384,12 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                         const from = scenePositions[scene.id];
                         const to = scenePositions[scene.flowTo];
                         if (!from || !to) return null;
+                        const fromH = collapsedScenes[scene.id] ? CARD_H_COLLAPSED : CARD_H;
+                        const toH = collapsedScenes[scene.flowTo] ? CARD_H_COLLAPSED : CARD_H;
                         const x1 = from.x + CARD_W / 2;
-                        const y1 = from.y + CARD_H / 2;
+                        const y1 = from.y + fromH / 2;
                         const x2 = to.x + CARD_W / 2;
-                        const y2 = to.y + CARD_H / 2;
+                        const y2 = to.y + toH / 2;
                         return (
                           <line
                             key={`${scene.id}->${scene.flowTo}`}
@@ -1849,6 +2408,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                     </svg>
                     {script.scenes.map((scene, idx) => {
                       const pos = scenePositions[scene.id] || { x: CANVAS_PAD, y: CANVAS_PAD };
+                      const isCollapsed = !!collapsedScenes[scene.id];
                       const transitionValue = scene.transition || settings.defaultTransition || 'fade';
                       const filterValue = scene.filter || settings.defaultFilter || 'none';
                       const transitionLabel = transitionOptions.find(t => t.id === transitionValue)?.label || transitionValue;
@@ -1857,10 +2417,10 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                       const inboundCount = script.scenes.filter(s => s.flowTo === scene.id).length;
                       return (
                         <div key={scene.id} className="absolute" style={{ left: pos.x, top: pos.y }}>
-                          <div className={`relative w-72 glass rounded-2xl overflow-hidden border shadow-xl transition-colors ${scene.localImage ? 'border-green-500/20' : 'border-gray-800'}`}>
+                          <div className={`relative w-72 glass rounded-2xl overflow-hidden border shadow-xl transition-all ${scene.localImage ? 'border-green-500/20' : 'border-gray-800'}`}>
                             {livePreview?.sceneId === scene.id && (
                               <div className="absolute inset-0 z-20 bg-black/70 backdrop-blur-sm text-white text-[11px] font-black uppercase tracking-[0.18em] flex items-center justify-center animate-pulse">
-                                Pré-visualização: {livePreview.label}
+                                Pre-visualizacao: {livePreview.label}
                               </div>
                             )}
                             <div
@@ -1877,12 +2437,23 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                               </div>
                               <div className="flex items-center gap-2">
                                 <span className="text-[9px] font-mono text-gray-600">{scene.localImage ? 'IMG' : 'SEM IMG'}</span>
+                                <span className={`text-[9px] font-mono ${scene.localSfx ? 'text-amber-300' : 'text-gray-600'}`}>{scene.localSfx ? 'SFX' : 'SEM SFX'}</span>
                                 <span className="text-[9px] px-2 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-100">{transitionValue}</span>
                                 <span className="text-[9px] px-2 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-100">{filterValue}</span>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleSceneCollapse(scene.id);
+                                  }}
+                                  className="text-[9px] px-2 py-1 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:border-blue-400 transition-all"
+                                  title={isCollapsed ? 'Expandir card' : 'Recolher card'}
+                                >
+                                  {isCollapsed ? 'Expandir' : 'Recolher'}
+                                </button>
                               </div>
                             </div>
 
-                            <div className="h-28 bg-gray-950 relative group/asset border-b border-gray-800">
+                            <div className={`${isCollapsed ? 'h-20' : 'h-28'} bg-gray-950 relative group/asset border-b border-gray-800`}>
                               {scene.localImage ? (
                                 <img src={scene.localImage} className="w-full h-full object-cover transition-transform duration-700 group-hover/asset:scale-105" />
                               ) : (
@@ -1900,6 +2471,17 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                               </label>
                             </div>
 
+                            {isCollapsed ? (
+                              <div className="px-4 py-3 flex flex-col gap-2">
+                                <div className="text-[10px] text-gray-400 uppercase tracking-widest">Resumo</div>
+                                <div className="text-[11px] text-gray-200 line-clamp-2">
+                                  {scene.text || 'Sem narracao'}
+                                </div>
+                                <div className="text-[10px] text-cyan-200 bg-black/30 border border-gray-800 rounded-lg px-2 py-1 line-clamp-2">
+                                  {(scene.visualPrompt || '').trim() || 'Sem prompt visual'}
+                                </div>
+                              </div>
+                            ) : (
                             <div className="p-4 flex flex-col gap-3">
                               <div className="flex justify-between items-center">
                                 <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Narracao</label>
@@ -1933,9 +2515,69 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                                 )}
                               </div>
 
+                              <div className="flex flex-col gap-2 border-t border-gray-800/40 pt-3">
+                                <div className="flex items-center justify-between">
+                                  <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Efeito sonoro (SFX)</label>
+                                  <div className="flex items-center gap-2">
+                                    <label className="text-[9px] px-2 py-1 rounded-lg border border-amber-500/40 text-amber-200 hover:text-white hover:border-amber-300 transition-all cursor-pointer">
+                                      Upload
+                                      <input type="file" className="hidden" accept="audio/*" onChange={(e) => e.target.files?.[0] && handleFileUpload('scene_sfx', scene.id, e.target.files[0])} />
+                                    </label>
+                                    {scene.localSfx && (
+                                      <>
+                                        <button
+                                          onClick={() => playNarration(scene.localSfx!)}
+                                          className="text-[9px] px-2 py-1 rounded-lg border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 transition-all"
+                                        >
+                                          Ouvir
+                                        </button>
+                                        <button
+                                          onClick={() => updateScene(scene.id, { localSfx: undefined })}
+                                          className="text-[9px] px-2 py-1 rounded-lg border border-red-500/40 text-red-300 hover:text-white hover:border-red-300 transition-all"
+                                        >
+                                          Remover
+                                        </button>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="text-[10px] text-gray-400">
+                                  {scene.localSfx ? 'SFX carregado para esta cena' : 'Opcional: adicione som ambiente/pontual desta cena'}
+                                </div>
+                                <label className="text-[10px] text-gray-400 flex flex-col gap-1">
+                                  Volume SFX {Math.round((scene.sfxVolume ?? 0.35) * 100)}%
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={1.2}
+                                    step={0.05}
+                                    value={scene.sfxVolume ?? 0.35}
+                                    onChange={(e) => updateScene(scene.id, { sfxVolume: Number(e.target.value) })}
+                                  />
+                                </label>
+                              </div>
+
+                              <div className="flex flex-col gap-2">
+                                <div className="flex items-center justify-between">
+                                  <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Prompt visual</label>
+                                  <button
+                                    onClick={() => copyScenePrompt(scene, idx)}
+                                    className="text-[9px] px-2 py-1 rounded-lg border border-cyan-500/40 text-cyan-200 hover:text-white hover:border-cyan-300 transition-all"
+                                  >
+                                    Copiar
+                                  </button>
+                                </div>
+                                <textarea
+                                  className="w-full bg-black/40 rounded-xl p-3 text-[11px] text-gray-200 border border-gray-800 focus:border-cyan-500/40 outline-none h-24 resize-none leading-relaxed"
+                                  value={scene.visualPrompt || ''}
+                                  onChange={(e) => updateScene(scene.id, { visualPrompt: e.target.value })}
+                                  placeholder="Descreva aqui o prompt visual detalhado desta cena..."
+                                />
+                              </div>
+
                               <div className="grid grid-cols-2 gap-3 border-t border-gray-800/40 pt-3">
                                 <div className="flex flex-col gap-1">
-                                  <label className="text-[10px] uppercase text-gray-500 font-black">Transição</label>
+                                  <label className="text-[10px] uppercase text-gray-500 font-black">Transicao</label>
                                   <select
                                     value={transitionValue}
                                     onChange={(e) => updateScene(scene.id, { transition: e.target.value })}
@@ -1977,7 +2619,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                                     onChange={(e) => updateScene(scene.id, { flowTo: e.target.value || null })}
                                     className="bg-black/40 text-xs p-2 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-blue-500/50 transition-all"
                                   >
-                                    <option value="">Sem ligação</option>
+                                    <option value="">Sem ligacao</option>
                                     {flowTargets.map((t) => (
                                       <option key={t.id} value={t.id}>
                                         Cena {script.scenes.findIndex(s => s.id === t.id) + 1}: {t.text.slice(0, 40) || '...'}
@@ -1996,6 +2638,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                                 <button onClick={() => deleteScene(scene.id)} className="flex-1 py-2 bg-gray-900/50 rounded-xl text-[9px] font-black text-gray-500 hover:text-red-400 border border-gray-800 transition-all uppercase tracking-widest">Excluir</button>
                               </div>
                             </div>
+                            )}
                           </div>
                         </div>
                       );
@@ -2113,8 +2756,8 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
 
           {/* RENDER */}
           {script && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pb-12">
-              <div className="lg:col-span-8 glass rounded-[2.5rem] p-6 min-h-[360px] flex flex-col gap-4 relative border border-gray-800/70 overflow-hidden shadow-2xl">
+            <div className="pb-12">
+              <div className="glass rounded-[2.5rem] p-6 min-h-[360px] flex flex-col gap-4 relative border border-gray-800/70 overflow-hidden shadow-2xl">
                 {isGeneratingVideo && (
                   <div className="absolute inset-0 bg-black/90 backdrop-blur-2xl z-[60] flex flex-col items-center justify-center rounded-[2.5rem] p-12 text-center">
                     <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-6"></div>
@@ -2123,7 +2766,7 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                     <div className="w-full max-w-md text-left">
                       <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 uppercase tracking-widest mb-1">
                         <span>{renderStage || 'Etapa'}</span>
-                        <span>{renderProgress.toFixed(0)}%</span>
+                        <span>{renderProgressLabel}%</span>
                       </div>
                       <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
                         <div className="h-full bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400" style={{ width: `${renderProgress}%` }}></div>
@@ -2159,127 +2802,6 @@ const applySessionPayload = (payload: SessionPayload | null): boolean => {
                 </div>
               </div>
 
-              <div className="lg:col-span-4 flex flex-col gap-4">
-                <div className="glass p-5 rounded-[2rem] border-blue-500/10 flex flex-col gap-4 shadow-2xl">
-                  <h3 className="font-black text-xs text-blue-500 uppercase tracking-[0.3em]">Painel de Render</h3>
-
-                  <div className="pt-4 border-t border-gray-800 text-[11px] space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-gray-500 font-mono">Roteiro</span>
-                      <div className="flex gap-2">
-                        <label className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 cursor-pointer hover:border-blue-500/50 transition-all">
-                          Importar
-                          <input type="file" accept="application/json" className="hidden" onChange={(e) => e.target.files?.[0] && handleImportScript(e.target.files[0])} />
-                        </label>
-                        <button onClick={downloadScript} disabled={!script} className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-40 transition-all">Exportar</button>
-                      </div>
-                    </div>
-                    {importError && <p className="text-xs text-red-400">{importError}</p>}
-                  </div>
-
-                  <div className="pt-3 border-t border-gray-800 text-[11px] space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-gray-500 font-mono">Limpar cache</span>
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          min={1}
-                          className="w-16 bg-black/40 border border-gray-800 rounded-lg px-2 py-1 text-[10px] text-white outline-none focus:border-blue-500/40"
-                          value={cleanupAgeDays}
-                          onChange={(e) => setCleanupAgeDays(Math.max(1, Number(e.target.value) || 7))}
-                          title="Dias mÃ¡ximos para manter assets"
-                        />
-                        <button
-                          onClick={cleanupCache}
-                          disabled={isCleaningCache}
-                          className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-50 transition-all"
-                        >
-                          {isCleaningCache ? 'Limpando...' : 'Executar'}
-                        </button>
-                      </div>
-                    </div>
-                    {cleanupResult && <p className="text-[10px] text-green-300">{cleanupResult}</p>}
-                  </div>
-
-                  <div className="pt-3 border-t border-gray-800 text-[11px] space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <span className="text-gray-500 font-mono">Volumes</span>
-                      <div className="flex-1 grid grid-cols-2 gap-3">
-                        <label className="flex flex-col gap-1 text-[10px] text-gray-400">
-                          Música {Math.round(musicVolume * 100)}%
-                          <input type="range" min={0} max={1} step={0.05} value={musicVolume} onChange={(e)=>setMusicVolume(Number(e.target.value))} />
-                        </label>
-                        <label className="flex flex-col gap-1 text-[10px] text-gray-400">
-                          Narração {Math.round(narrationVolume * 100)}%
-                          <input type="range" min={0.3} max={1.5} step={0.05} value={narrationVolume} onChange={(e)=>setNarrationVolume(Number(e.target.value))} />
-                        </label>
-                      </div>
-                    </div>
-
-                    <div className="flex items-start justify-between gap-3">
-                      <span className="text-gray-500 font-mono">Legendas</span>
-                      <div className="flex-1 space-y-2">
-                        <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-400">
-                          <label className="flex flex-col gap-1">
-                            Tamanho {captionScale.toFixed(2)}x
-                            <input type="range" min={0.7} max={1.4} step={0.05} value={captionScale} onChange={(e)=>setCaptionScale(Number(e.target.value))} />
-                          </label>
-                          <label className="flex flex-col gap-1">
-                            Opacidade BG {Math.round(captionBg*100)}%
-                            <input type="range" min={0} max={1} step={0.05} value={captionBg} onChange={(e)=>setCaptionBg(Number(e.target.value))} />
-                          </label>
-                          <label className="flex flex-col gap-1">
-                            Posição Y {captionY}%
-                            <input type="range" min={60} max={90} step={1} value={captionY} onChange={(e)=>setCaptionY(Number(e.target.value))} />
-                          </label>
-                        </div>
-                        <div className="flex items-center gap-3 text-[10px] text-gray-300">
-                          <span>Cor</span>
-                          <input type="color" value={captionColor} onChange={(e)=>setCaptionColor(e.target.value)} />
-                          <span>Destaque</span>
-                          <input type="color" value={captionHighlight} onChange={(e)=>setCaptionHighlight(e.target.value)} />
-                        </div>
-                        <div className="mt-1 p-3 rounded-xl border border-gray-800 bg-black/40 text-center text-[11px]">
-                          <span style={{backgroundColor:`rgba(0,0,0,${captionBg})`, padding:'6px 10px', borderRadius:'10px', display:'inline-block', color: captionColor}}>
-                            LEGENDAS PRÉVIA <span style={{color: captionHighlight}}>DESTAQUE</span>
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex items-start justify-between gap-3">
-                      <span className="text-gray-500 font-mono">Efeitos</span>
-                      <div className="flex-1 grid grid-cols-2 gap-3 text-[10px] text-gray-400">
-                        <label className="flex flex-col gap-1">
-                          Força de cor {colorStrength.toFixed(2)}
-                          <input type="range" min={0} max={1.2} step={0.05} value={colorStrength} onChange={(e)=>setColorStrength(Number(e.target.value))} />
-                        </label>
-                        <label className="flex flex-col gap-1">
-                          Duração de transição {transitionDuration.toFixed(2)}s
-                          <input type="range" min={0.2} max={1.2} step={0.05} value={transitionDuration} onChange={(e)=>setTransitionDuration(Number(e.target.value))} />
-                        </label>
-                      </div>
-                    </div>
-                  </div>
-
-                <div className="pt-4 border-t border-gray-800">
-                  <button
-                    onClick={generateFullVideo}
-                    disabled={isGeneratingVideo}
-                    className="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all active:scale-[0.98] shadow-xl shadow-blue-900/30"
-                  >
-                    {isGeneratingVideo ? <Loader /> : "Processar Projeto"}
-                  </button>
-                  <button
-                    onClick={testRenderPipeline}
-                    disabled={isGeneratingVideo || isTestingRender}
-                    className="w-full mt-3 border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 px-4 py-3 rounded-[1.4rem] font-black text-xs uppercase tracking-[0.22em] transition-all"
-                  >
-                    {isTestingRender ? <Loader /> : "Forçar teste (ver logs)"}
-                  </button>
-                </div>
-              </div>
-            </div>
             </div>
           )}
         </main>
@@ -2297,4 +2819,10 @@ const Loader: React.FC = () => (
 
 const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
+
+
+
+
+
+
 

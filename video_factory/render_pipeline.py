@@ -40,6 +40,8 @@ class RenderScene(BaseModel):
     text: str
     visualPrompt: Optional[str] = None
     localImage: Optional[str] = None
+    localSfx: Optional[str] = None
+    sfxVolume: Optional[float] = 0.35
     animationType: Optional[str] = None
     transition: Optional[str] = None
     filter: Optional[str] = None
@@ -55,6 +57,7 @@ class RenderRequest(BaseModel):
     transitionDuration: Optional[float] = None
     colorFilter: Optional[str] = None
     colorStrength: float = 0.35
+    imageScale: float = 1.0
     musicVolume: float = config.MUSIC_VOLUME
     narrationVolume: float = config.NARRATION_VOLUME
     captionFontScale: float = config.CAPTION_FONT_SCALE
@@ -71,8 +74,11 @@ class RenderRequest(BaseModel):
 
 @dataclass
 class SceneAsset:
+    text: str
     image_path: Path
     audio_path: Path
+    sfx_path: Optional[Path]
+    sfx_volume: float
     animation: Optional[str]
     transition: Optional[str]
     color_filter: Optional[str]
@@ -152,6 +158,19 @@ def _prepare_background_music(value: Optional[str]) -> Optional[Path]:
     return None
 
 
+def _prepare_scene_sfx(value: Optional[str]) -> Optional[Path]:
+    if not value:
+        return None
+    if value.startswith("data:"):
+        ext, payload = _decode_data_url(value)
+        path = _write_asset("audio", payload, ext)
+        return _coerce_music_for_moviepy(path)
+    path = Path(value)
+    if path.exists():
+        return _coerce_music_for_moviepy(path)
+    return None
+
+
 def _coerce_music_for_moviepy(path: Path) -> Path:
     """
     Normaliza arquivo de música para formatos que o MoviePy costuma ler bem.
@@ -219,11 +238,19 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
         image_path = _ensure_visual_path(scene, idx)
         audio_bytes, metadata, audio_ext = await synthesize_to_bytes_with_metadata(scene.text, voice)
         audio_path = _write_asset("audio", audio_bytes, audio_ext or "mp3")
+        sfx_path = _prepare_scene_sfx(scene.localSfx)
+        try:
+            sfx_volume = max(0.0, min(2.0, float(scene.sfxVolume if scene.sfxVolume is not None else 0.35)))
+        except Exception:
+            sfx_volume = 0.35
         timings = word_timings_from_chunks(metadata)
         scene_assets.append(
             SceneAsset(
+                text=scene.text,
                 image_path=image_path,
                 audio_path=audio_path,
+                sfx_path=sfx_path,
+                sfx_volume=sfx_volume,
                 animation=scene.animationType,
                 transition=scene.transition,
                 color_filter=scene.filter,
@@ -241,6 +268,7 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
         transition_duration=request.transitionDuration,
         color_filter=request.colorFilter,
         color_strength=request.colorStrength,
+        image_scale=request.imageScale,
         narration_volume=request.narrationVolume,
         music_volume=request.musicVolume,
         caption_font_scale=request.captionFontScale,
@@ -270,25 +298,30 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
             music_volume=request.musicVolume,
             scene_effects=[asset.animation for asset in scene_assets],
             scene_word_timings=[asset.word_timings for asset in scene_assets],
+            scene_texts=[asset.text for asset in scene_assets],
             scene_transitions=[asset.transition for asset in scene_assets],
             scene_filters=[asset.color_filter for asset in scene_assets],
+            scene_sfx_paths=[asset.sfx_path for asset in scene_assets],
+            scene_sfx_volumes=[asset.sfx_volume for asset in scene_assets],
+            progress_cb=lambda pct, msg: _progress("render", pct, msg),
         )
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _build)
 
     # Pós-processamento opcional com FFmpeg filtergraph (não bloqueia render principal)
+    _progress("post", 0.2, "Finalizando arquivo")
     if request.ffmpegFilters:
         try:
-            _progress("post", 0.2, "Aplicando filtros FFmpeg")
+            _progress("post", 0.4, "Aplicando filtros FFmpeg")
             filtered = await loop.run_in_executor(None, run_ffmpeg_filtergraph, result, request.ffmpegFilters)
             if filtered:
                 result = filtered
-            _progress("post", 1.0, "Filtros aplicados")
+            _progress("post", 0.95, "Filtros aplicados")
         except Exception as exc:  # noqa: BLE001
             logger.warning("FFmpeg filters falharam: %s", exc)
-            _progress("post", 1.0, "Filtros ignorados")
+            _progress("post", 0.95, "Filtros ignorados")
 
-    _progress("render", 1.0, "Render finalizado")
+    _progress("post", 1.0, "Render finalizado")
     logger.info("[5/5] Render finalizado: %s", result)
     return result
