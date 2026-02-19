@@ -58,7 +58,7 @@ TTS_PROVIDER = env("TTS_PROVIDER", "edge,offline")  # ordem de tentativa: ex. "e
 
 # Vídeo / render
 FPS = int(env("VIDEO_FPS", "30"))
-CODEC = env("VIDEO_CODEC", "libx264")
+CODEC = env("VIDEO_CODEC", "auto")
 AUDIO_CODEC = env("AUDIO_CODEC", "aac")
 ASPECT = env("VIDEO_ASPECT", "16:9")  # 16:9 ou 9:16
 

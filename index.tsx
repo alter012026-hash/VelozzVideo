@@ -248,6 +248,11 @@ const App: React.FC = () => {
   const [renderTaskId, setRenderTaskId] = useState<string | null>(null);
   const [renderProgress, setRenderProgress] = useState<number>(0);
   const [renderStage, setRenderStage] = useState<string>('');
+  const [renderRealPct, setRenderRealPct] = useState<number>(0);
+  const [renderRealInfo, setRenderRealInfo] = useState<string>('');
+  const [renderStaleSeconds, setRenderStaleSeconds] = useState<number>(0);
+  const [renderElapsedSeconds, setRenderElapsedSeconds] = useState<number>(0);
+  const renderStartedAtRef = useRef<number | null>(null);
   const [format, setFormat] = useState<'16:9' | '9:16'>('16:9');
   const [importError, setImportError] = useState<string | null>(null);
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
@@ -1689,6 +1694,11 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
     setCurrentStep('rendering');
     setRenderProgress(0);
     setRenderStage('Iniciando');
+    setRenderRealPct(0);
+    setRenderRealInfo('');
+    setRenderStaleSeconds(0);
+    setRenderElapsedSeconds(0);
+    renderStartedAtRef.current = Date.now();
     setStatusMessage('Iniciando render com motor local...');
 
     let producedUrl: string | null = null;
@@ -1764,17 +1774,37 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
         const st = await stRes.json();
         const stageLabel = st.stage || '';
         const staleSeconds = Number(st.stale_seconds || 0);
+        const stageProgressPct = Math.max(0, Math.min(100, Number(st.stage_progress || 0) * 100));
+        const detail = (st.render_detail || null) as any;
         const backendPct = Math.max(0, Math.min(100, Number(st.progress || 0) * 100));
         const syntheticPct = stageLabel === 'finalizando'
           ? Math.min(99.9, Math.max(backendPct, 98.5 + Math.min(staleSeconds, 120) * 0.012))
           : backendPct;
         const fallbackMsg = stageLabel === 'finalizando'
-          ? 'Finalizando arquivo de vídeo. Esta etapa pode levar alguns minutos.'
+          ? `Finalizando arquivo de vídeo. Render ativo (${Math.round(staleSeconds)}s sem novos frames). Não travou.`
           : staleSeconds >= 12
-            ? 'Processando...'
+            ? `Render ativo... ${Math.round(staleSeconds)}s sem nova atualização.`
             : '';
         setRenderStage(stageLabel);
+        setRenderStaleSeconds(staleSeconds);
         setRenderProgress(syntheticPct);
+        setRenderRealPct(stageProgressPct);
+        if (String(stageLabel).toLowerCase() === 'render') {
+          const current = Number(detail?.current || 0);
+          const total = Number(detail?.total || 0);
+          const fps = Number(detail?.fps || 0);
+          if (total > 0) {
+            setRenderRealInfo(`Frames ${current}/${total}${fps > 0 ? ` • ${fps.toFixed(1)} fps` : ''}`);
+          } else {
+            setRenderRealInfo(`Montagem ${stageProgressPct.toFixed(1)}%`);
+          }
+        } else if (String(stageLabel).toLowerCase() === 'tts') {
+          setRenderRealInfo(`Narrações ${stageProgressPct.toFixed(1)}%`);
+        } else if (String(stageLabel).toLowerCase() === 'post' || String(stageLabel).toLowerCase() === 'finalizando') {
+          setRenderRealInfo(`Finalização ${stageProgressPct.toFixed(1)}%`);
+        } else {
+          setRenderRealInfo('');
+        }
         setStatusMessage(st.message || fallbackMsg);
         if (st.done) {
           done = true;
@@ -1791,6 +1821,8 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
           setVideoUrl(finalUrl);
           setRenderProgress(100);
           setRenderStage('Concluído');
+          setRenderRealPct(100);
+          setRenderRealInfo('Montagem concluída');
           setStatusMessage('Render concluído');
           pushLog(`Render concluído: ${finalUrl || rawUrl || st.output}`, 'info');
           setTimelineEditMode('post');
@@ -1809,8 +1841,15 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       setRenderStage(prev => (prev === 'Concluído' ? prev : ''));
       setRenderTaskId(null);
       if (!producedUrl) {
+        setRenderRealPct(0);
+        setRenderRealInfo('');
+      }
+      setRenderStaleSeconds(0);
+      renderStartedAtRef.current = null;
+      if (!producedUrl) {
         setStatusMessage('');
         setRenderProgress(0);
+        setRenderElapsedSeconds(0);
       }
     }
   };
@@ -1854,6 +1893,8 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       setVideoUrl(finalUrl);
       setRenderProgress(100);
       setRenderStage('Concluído');
+      setRenderRealPct(100);
+      setRenderRealInfo('Montagem concluída');
       setTimelineEditMode('post');
       setWorkspacePage('studio');
       setCurrentStep('done');
@@ -1871,6 +1912,14 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
   const renderProgressLabel = (renderStage || '').toLowerCase() === 'finalizando'
     ? renderProgress.toFixed(1)
     : renderProgress.toFixed(0);
+  const formatRenderElapsed = (seconds: number) => {
+    const safe = Math.max(0, Math.floor(Number(seconds) || 0));
+    const mm = Math.floor(safe / 60);
+    const ss = safe % 60;
+    return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+  };
+  const renderStageLower = String(renderStage || '').toLowerCase();
+  const renderIsWaiting = renderStageLower === 'finalizando' || renderStaleSeconds >= 10;
   const estimateSceneDuration = (scene: Scene) => {
     const words = String(scene.text || '').trim().split(/\s+/).filter(Boolean).length;
     const base = Math.max(1.2, (words / 2.7) + 0.6);
@@ -1996,6 +2045,18 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
     setIsTimelinePlaying(false);
     setTimelinePlayheadSec(Math.max(0, Math.min(next, timelineDurationSafe)));
   };
+
+  useEffect(() => {
+    if (!isGeneratingVideo) return;
+    const tick = () => {
+      const startedAt = renderStartedAtRef.current;
+      if (!startedAt) return;
+      setRenderElapsedSeconds((Date.now() - startedAt) / 1000);
+    };
+    tick();
+    const intervalId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [isGeneratingVideo]);
 
   const moveSceneToTime = (sceneId: string, targetSec: number) => {
     if (!script || script.scenes.length <= 1) return;
@@ -3553,7 +3614,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
           {/* RENDER */}
           {script && (
             <div className="pb-12">
-              <div className="glass rounded-[2.5rem] p-6 min-h-[360px] flex flex-col gap-4 relative border border-gray-800/70 overflow-hidden shadow-2xl">
+              <div className="glass rounded-[2.5rem] p-6 flex flex-col gap-4 relative border border-gray-800/70 overflow-hidden shadow-2xl">
                 {isGeneratingVideo && (
                   <div className="absolute inset-0 bg-black/90 backdrop-blur-2xl z-[60] flex flex-col items-center justify-center rounded-[2.5rem] p-12 text-center">
                     <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-6"></div>
@@ -3564,8 +3625,33 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
                         <span>{renderStage || 'Etapa'}</span>
                         <span>{renderProgressLabel}%</span>
                       </div>
-                      <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
+                      <div className="relative w-full h-2 rounded-full bg-white/10 overflow-hidden">
                         <div className="h-full bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400" style={{ width: `${renderProgress}%` }}></div>
+                        {renderIsWaiting && (
+                          <div className="absolute inset-0 bg-white/15 animate-pulse pointer-events-none"></div>
+                        )}
+                      </div>
+                      {String(renderStage || '').toLowerCase() === 'render' && (
+                        <div className="mt-2">
+                          <div className="flex items-center justify-between text-[10px] font-mono text-gray-500 mb-1">
+                            <span>Montagem real</span>
+                            <span>{renderRealPct.toFixed(1)}%</span>
+                          </div>
+                          <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+                            <div className="h-full bg-gradient-to-r from-emerald-400 to-cyan-400" style={{ width: `${renderRealPct}%` }}></div>
+                          </div>
+                          {renderRealInfo && (
+                            <div className="mt-1 text-[10px] font-mono text-emerald-300">{renderRealInfo}</div>
+                          )}
+                        </div>
+                      )}
+                      <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-gray-500">
+                        <span className={`${renderIsWaiting ? 'text-cyan-300' : 'text-gray-500'}`}>
+                          {renderIsWaiting
+                            ? `Render ativo. ${Math.round(renderStaleSeconds)}s sem novos frames, aguarde.`
+                            : renderRealInfo || 'Recebendo progresso do backend.'}
+                        </span>
+                        <span>{formatRenderElapsed(renderElapsedSeconds)}</span>
                       </div>
                     </div>
                   </div>
@@ -3593,7 +3679,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
                   )}
                 </div>
 
-                <div className={`w-full bg-black rounded-2xl border border-gray-800 overflow-hidden ${format === '16:9' ? 'aspect-video' : 'aspect-[9/16] max-w-[420px] mx-auto'}`}>
+                <div className={`mx-auto w-full bg-black rounded-2xl border border-gray-800 overflow-hidden ${format === '16:9' ? 'aspect-video max-w-[760px]' : 'aspect-[9/16] max-w-[340px]'}`}>
                   {videoUrl ? (
                     <video key={videoUrl} controls preload="metadata" playsInline className="w-full h-full object-contain">
                       <source src={videoUrl} type="video/mp4" />

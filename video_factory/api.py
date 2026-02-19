@@ -255,14 +255,16 @@ async def _run_render_task(task_id: str, request: RenderRequest) -> None:
             output=None,
         )
 
-        def _progress(stage: str, pct: float, msg: str):
-            _set_status(
-                task_id,
+        def _progress(stage: str, pct: float, msg: str, detail: Dict[str, Any] | None = None):
+            payload: Dict[str, Any] = dict(
                 stage=stage,
                 stage_progress=max(0.0, min(1.0, float(pct))),
                 progress=_map_stage_progress(stage, pct),
                 message=msg,
             )
+            if detail:
+                payload["render_detail"] = detail
+            _set_status(task_id, **payload)
 
         path = await render_script(request, progress_cb=_progress)
         web = _path_to_web(path)
@@ -327,7 +329,7 @@ async def render_status(task_id: str):
         if stage == "render" and stage_progress >= 0.995 and stale_seconds >= 8:
             payload["stage"] = "finalizando"
             payload["progress"] = max(current_progress, 0.985)
-            payload["message"] = "Finalizando arquivo de video..."
+            payload["message"] = "Finalizando arquivo de video... processo ativo, pode levar alguns minutos sem novos frames."
         elif stale_seconds >= 12:
             current_message = str(payload.get("message") or "").strip()
             if current_message:

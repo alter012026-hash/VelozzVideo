@@ -224,7 +224,10 @@ def _sanitize_title(value: str) -> str:
     return safe[:80]
 
 
-async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[str, float, str], None]] = None) -> Path:
+async def render_script(
+    request: RenderRequest,
+    progress_cb: Optional[Callable[[str, float, str, Optional[dict]], None]] = None,
+) -> Path:
     if not request.scenes:
         raise RuntimeError("Nenhuma cena informada.")
 
@@ -232,10 +235,10 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
     scene_assets: List[SceneAsset] = []
     total_scenes = len(request.scenes)
 
-    def _progress(stage: str, pct: float, msg: str = "") -> None:
+    def _progress(stage: str, pct: float, msg: str = "", detail: Optional[dict] = None) -> None:
         if progress_cb:
             try:
-                progress_cb(stage, max(0.0, min(1.0, float(pct))), msg)
+                progress_cb(stage, max(0.0, min(1.0, float(pct))), msg, detail)
             except Exception:
                 pass
 
@@ -335,7 +338,7 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
             scene_filters=[asset.color_filter for asset in scene_assets],
             scene_sfx_paths=[asset.sfx_path for asset in scene_assets],
             scene_sfx_volumes=[asset.sfx_volume for asset in scene_assets],
-            progress_cb=lambda pct, msg: _progress("render", pct, msg),
+            progress_cb=lambda pct, msg, detail=None: _progress("render", pct, msg, detail),
         )
 
     loop = asyncio.get_running_loop()

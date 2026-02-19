@@ -54,15 +54,19 @@ from video_factory.tts_metadata import WordTiming, approximate_word_timings
 from video_factory import config
 
 logger = logging.getLogger(__name__)
+_GPU_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf")
+_ENCODER_CACHE: dict[tuple[str, str], tuple[str, str, str]] = {}
 
 
 class _RenderProgressLogger(ProgressBarLogger):
     """Bridge MoviePy/Proglog progress to our render callback."""
 
-    def __init__(self, progress_cb: Callable[[float, str], None]):
+    def __init__(self, progress_cb: Callable[[float, str, Optional[dict[str, Any]]], None]):
         super().__init__()
         self._progress_cb = progress_cb
         self._last_progress = -1.0
+        self._last_value = 0.0
+        self._last_ts = datetime.now().timestamp()
 
     def bars_callback(self, bar, attr, value, old_value=None):  # type: ignore[override]
         info = self.bars.get(bar) or {}
@@ -70,13 +74,31 @@ class _RenderProgressLogger(ProgressBarLogger):
         if not total:
             return
         try:
-            pct = max(0.0, min(1.0, float(value) / float(total)))
+            cur = float(value)
+            tot = float(total)
+            pct = max(0.0, min(1.0, cur / tot))
         except Exception:
             return
-        if pct - self._last_progress < 0.01 and pct < 1.0:
+        if pct - self._last_progress < 0.005 and pct < 1.0:
             return
+        now_ts = datetime.now().timestamp()
+        dt = max(1e-6, now_ts - self._last_ts)
+        fps = max(0.0, (cur - self._last_value) / dt)
+        self._last_value = cur
+        self._last_ts = now_ts
         self._last_progress = pct
-        self._progress_cb(pct, f"Montando video ({int(pct * 100)}%)")
+        details = {
+            "bar": str(bar),
+            "current": int(cur),
+            "total": int(tot),
+            "real_pct": round(pct * 100, 2),
+            "fps": round(fps, 2),
+        }
+        self._progress_cb(
+            pct,
+            f"Montando video ({pct * 100:.1f}%) - {int(cur)}/{int(tot)} frames",
+            details,
+        )
 
 
 def _ensure_dirs() -> None:
@@ -85,6 +107,146 @@ def _ensure_dirs() -> None:
 
 
 _ensure_dirs()
+
+
+def _get_ffmpeg_binary() -> str:
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_bin:
+            return str(ffmpeg_bin)
+    except Exception:
+        pass
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _list_available_encoders(ffmpeg_bin: str) -> set[str]:
+    try:
+        proc = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        output = f"{proc.stdout}\n{proc.stderr}"
+    except Exception:
+        return set()
+
+    encoders: set[str] = set()
+    for line in output.splitlines():
+        item = line.strip()
+        # Ex.: "V..... libx264 ..."
+        match = re.match(r"^[A-Z\.]{6}\s+([A-Za-z0-9_]+)\b", item)
+        if match:
+            encoders.add(match.group(1).lower())
+    return encoders
+
+
+def _preset_candidates(codec: str, preferred: str) -> list[str]:
+    codec = (codec or "").strip().lower()
+    preferred = (preferred or "").strip().lower()
+    candidates: list[str] = []
+
+    if codec == "h264_nvenc":
+        candidates.extend([preferred, "fast", "medium", "slow", "p4", "default"])
+    elif codec == "h264_qsv":
+        candidates.extend([preferred, "veryfast", "faster", "fast", "medium"])
+    elif codec == "h264_amf":
+        amf_map = {
+            "ultrafast": "speed",
+            "superfast": "speed",
+            "veryfast": "speed",
+            "faster": "speed",
+            "fast": "speed",
+            "medium": "balanced",
+            "slow": "quality",
+            "slower": "quality",
+            "veryslow": "quality",
+        }
+        mapped = amf_map.get(preferred, preferred)
+        candidates.extend([mapped, "balanced", "speed", "quality"])
+    else:
+        candidates.extend([preferred, "veryfast", "faster", "fast", "medium"])
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in candidates:
+        value = str(item or "").strip().lower()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _probe_encoder(ffmpeg_bin: str, codec: str, preset: str) -> bool:
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=64x64:rate=24:duration=0.2",
+        "-frames:v",
+        "1",
+        "-an",
+        "-c:v",
+        codec,
+    ]
+    if preset:
+        cmd.extend(["-preset", preset])
+    cmd.extend(["-f", "null", "-"])
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=18,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _resolve_video_encoder(codec_pref: str, preset_pref: str) -> tuple[str, str, str]:
+    preferred_codec = (codec_pref or "auto").strip().lower()
+    preferred_preset = (preset_pref or "veryfast").strip().lower()
+    cache_key = (preferred_codec, preferred_preset)
+    cached = _ENCODER_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    ffmpeg_bin = _get_ffmpeg_binary()
+    available = _list_available_encoders(ffmpeg_bin)
+
+    if preferred_codec in {"auto", "gpu", "hardware", "hw"}:
+        candidates = [*list(_GPU_ENCODERS), "libx264"]
+    elif preferred_codec in _GPU_ENCODERS:
+        candidates = [preferred_codec, "libx264"]
+    else:
+        candidates = [preferred_codec]
+        if preferred_codec != "libx264":
+            candidates.append("libx264")
+
+    for codec in candidates:
+        if available and codec not in available:
+            continue
+        for preset in _preset_candidates(codec, preferred_preset):
+            if _probe_encoder(ffmpeg_bin, codec, preset):
+                mode = "gpu" if codec in _GPU_ENCODERS else "cpu"
+                result = (codec, preset, mode)
+                _ENCODER_CACHE[cache_key] = result
+                return result
+
+    fallback = ("libx264", "veryfast", "cpu")
+    _ENCODER_CACHE[cache_key] = fallback
+    return fallback
 
 if not hasattr(MoviepyClip, "set_duration"):
     def _compat_set_duration(self, duration, change_end=True):
@@ -521,7 +683,7 @@ class VideoBuilder:
         scene_filters: Optional[Sequence[str]] = None,
         scene_sfx_paths: Optional[Sequence[Optional[Path]]] = None,
         scene_sfx_volumes: Optional[Sequence[float]] = None,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
+        progress_cb: Optional[Callable[[float, str, Optional[dict[str, Any]]], None]] = None,
     ) -> Path:
         if len(visual_paths) != len(audio_paths):
             raise ValueError("NÃºmero de visuais e Ã¡udios precisa ser igual.")
@@ -634,20 +796,51 @@ class VideoBuilder:
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        render_logger = _RenderProgressLogger(progress_cb) if progress_cb else None
+        selected_codec, selected_preset, selected_mode = _resolve_video_encoder(CODEC, VIDEO_PRESET)
         if progress_cb:
-            progress_cb(0.0, "Preparando render de video")
-        final_video.write_videofile(
-            str(output_path),
-            fps=self.fps,
-            codec=CODEC,
-            audio_codec=AUDIO_CODEC,
-            threads=VIDEO_THREADS,
-            preset=VIDEO_PRESET,
-            logger=render_logger,
-        )
+            progress_cb(
+                0.0,
+                f"Preparando render de video ({selected_codec})",
+                {"phase": "prepare", "codec": selected_codec, "preset": selected_preset, "mode": selected_mode},
+            )
+
+        def _write_video(codec: str, preset: str) -> None:
+            render_logger = _RenderProgressLogger(progress_cb) if progress_cb else None
+            final_video.write_videofile(
+                str(output_path),
+                fps=self.fps,
+                codec=codec,
+                audio_codec=AUDIO_CODEC,
+                threads=VIDEO_THREADS,
+                preset=preset,
+                logger=render_logger,
+            )
+
+        used_codec = selected_codec
+        used_preset = selected_preset
+        try:
+            _write_video(selected_codec, selected_preset)
+        except Exception:
+            if selected_codec == "libx264":
+                raise
+            logger.exception("Encoder %s falhou; fallback para libx264.", selected_codec)
+            cpu_codec, cpu_preset, _ = _resolve_video_encoder("libx264", VIDEO_PRESET)
+            used_codec = cpu_codec
+            used_preset = cpu_preset
+            try:
+                output_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if progress_cb:
+                progress_cb(
+                    0.0,
+                    f"Encoder {selected_codec} indisponivel. Alternando para CPU ({cpu_codec}).",
+                    {"phase": "encoder_fallback", "codec": cpu_codec, "preset": cpu_preset, "mode": "cpu"},
+                )
+            _write_video(cpu_codec, cpu_preset)
+
         if progress_cb:
-            progress_cb(1.0, "Render de video concluido")
+            progress_cb(1.0, "Render de video concluido", {"phase": "done", "codec": used_codec, "preset": used_preset})
         final_video.close()
         for clip in clips:
             clip.close()
@@ -731,6 +924,7 @@ class VideoBuilder:
 
         caption_color = _ensure_visible_color(self.caption_color, "#FFFFFF")
         highlight_color = _ensure_visible_color(self.caption_highlight, "#FFD166")
+        caption_stroke = 0 if self.caption_bg_opacity >= 0.15 else 2
 
         def _wrap_caption_text(text: str, max_chars: int = 34, max_lines: int = 3) -> str:
             words = [w for w in text.split(" ") if w]
@@ -907,6 +1101,97 @@ class VideoBuilder:
                 )
             return text_clip
 
+        def _make_karaoke_line_clip(
+            words: List[str],
+            size_px: int,
+            base_color: str,
+            stroke_color: str,
+            stroke_width: int,
+            active_idx: Optional[int] = None,
+            active_color: Optional[str] = None,
+            highlight_only: bool = False,
+            with_bg: bool = True,
+        ) -> Any:
+            from PIL import Image, ImageDraw, ImageFont
+
+            clean_words = [w for w in words if str(w or "").strip()]
+            if not clean_words:
+                raise RuntimeError("Linha de karaoke vazia")
+
+            def _load_font(font_size_px: int) -> Any:
+                for font_name in ("arialbd.ttf", "DejaVuSans-Bold.ttf", "Arial.ttf", "DejaVuSans.ttf"):
+                    try:
+                        return ImageFont.truetype(font_name, font_size_px)
+                    except Exception:
+                        continue
+                return ImageFont.load_default()
+
+            font_size_px = max(16, int(size_px))
+            max_text_w = max(80, box_width - 24)
+            probe = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+            probe_draw = ImageDraw.Draw(probe)
+            font = _load_font(font_size_px)
+            word_boxes: List[tuple[int, int, int, int]] = []
+            space_w = 8
+            total_w = 0
+            line_h = 0
+
+            while True:
+                font = _load_font(font_size_px)
+                word_boxes = [probe_draw.textbbox((0, 0), word, font=font, stroke_width=stroke_width) for word in clean_words]
+                widths = [max(1, box[2] - box[0]) for box in word_boxes]
+                heights = [max(1, box[3] - box[1]) for box in word_boxes]
+                space_box = probe_draw.textbbox((0, 0), " ", font=font, stroke_width=stroke_width)
+                space_w = max(4, int((space_box[2] - space_box[0]) or (font_size_px * 0.25)))
+                total_w = sum(widths) + space_w * max(0, len(widths) - 1)
+                line_h = max(heights) if heights else max(16, int(font_size_px * 0.9))
+                if total_w <= max_text_w or font_size_px <= 18:
+                    break
+                font_size_px -= 2
+
+            pad_x = max(10, int(font_size_px * 0.35))
+            pad_y = max(8, int(font_size_px * 0.28))
+            canvas_w = min(self.width - 14, max(64, total_w + pad_x * 2))
+            canvas_h = max(28, line_h + pad_y * 2)
+            img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+
+            if with_bg and self.caption_bg_opacity > 0:
+                draw.rounded_rectangle(
+                    (0, 0, canvas_w - 1, canvas_h - 1),
+                    radius=max(8, int(font_size_px * 0.3)),
+                    fill=(0, 0, 0, int(255 * max(0.0, min(1.0, self.caption_bg_opacity)))),
+                )
+
+            base_rgb = _parse_hex_color(base_color, (255, 255, 255))
+            active_rgb = _parse_hex_color(active_color or highlight_color, (255, 209, 102))
+            stroke_rgb = _parse_hex_color(stroke_color, (0, 0, 0))
+            widths = [max(1, box[2] - box[0]) for box in word_boxes]
+            x = max(pad_x, int((canvas_w - total_w) / 2))
+            y = max(2, int((canvas_h - line_h) / 2))
+
+            for i, (word, w_word) in enumerate(zip(clean_words, widths)):
+                if highlight_only:
+                    if active_idx is None or i != active_idx:
+                        x += w_word + (space_w if i < len(clean_words) - 1 else 0)
+                        continue
+                    fill = (*active_rgb, 255)
+                else:
+                    fill_rgb = active_rgb if (active_idx is not None and i == active_idx) else base_rgb
+                    fill = (*fill_rgb, 255)
+
+                draw.text(
+                    (x, y),
+                    word,
+                    font=font,
+                    fill=fill,
+                    stroke_width=stroke_width,
+                    stroke_fill=(*stroke_rgb, 255),
+                )
+                x += w_word + (space_w if i < len(clean_words) - 1 else 0)
+
+            return ImageClip(np.array(img), transparent=True)
+
         # Quebra em janelas curtas para leitura e sincronia.
         chunks: List[List[tuple[str, float, float]]] = []
         current: List[tuple[str, float, float]] = []
@@ -927,10 +1212,16 @@ class VideoBuilder:
             chunks.append(current)
 
         caption_clips: List[Any] = []
+        highlight_clips: List[Any] = []
         for idx, chunk in enumerate(chunks):
-            chunk_text = " ".join(item[0] for item in chunk)
-            if not chunk_text:
+            chunk_tokens = [
+                (str(item[0]).strip().upper(), float(item[1]), float(item[2]))
+                for item in chunk
+                if str(item[0] or "").strip()
+            ]
+            if not chunk_tokens:
                 continue
+            chunk_words = [word for word, _, _ in chunk_tokens]
             start = max(0.0, min(chunk[0][1], clip.duration))
             if idx + 1 < len(chunks):
                 end = max(start + min_hold, min(clip.duration, chunks[idx + 1][0][1]))
@@ -939,44 +1230,42 @@ class VideoBuilder:
             if end <= start:
                 continue
             try:
-                base = _make_caption(
-                    text=chunk_text,
+                base = _make_karaoke_line_clip(
+                    words=chunk_words,
                     size_px=font_size,
-                    color=caption_color,
+                    base_color=caption_color,
                     stroke_color="#000000",
-                    stroke_width=2,
+                    stroke_width=caption_stroke,
+                    with_bg=True,
                 )
-                base = _add_caption_bg(base).with_start(start).with_duration(end - start).with_position(("center", y_pos))
+                base = base.with_start(start).with_duration(end - start).with_position(("center", y_pos))
                 caption_clips.append(base)
             except Exception:
                 logger.debug("Falha ao criar legenda base no chunk %s", idx)
                 continue
 
-        # Highlight sincronizado por palavra (ou grupo de palavras em cenas longas).
-        highlight_clips: List[Any] = []
-        max_highlights = max(24, int(KARAOKE_MAX_HIGHLIGHTS))
-        step = max(1, int(math.ceil(len(tokens) / max_highlights)))
-        highlight_y = max(8, y_pos - int(font_size * 1.25))
-        for i in range(0, len(tokens), step):
-            group = tokens[i : i + step]
-            text = " ".join(item[0] for item in group)
-            start = group[0][1]
-            end = group[-1][2]
-            if not text or end <= start:
-                continue
-            try:
-                hi = _make_caption(
-                    text=text,
-                    size_px=max(20, int(font_size * 0.9)),
-                    color=highlight_color,
-                    stroke_color="#111111",
-                    stroke_width=2,
-                )
-                hi = _add_caption_bg(hi, opacity=max(0.12, self.caption_bg_opacity * 0.7)).with_start(start).with_duration(end - start).with_position(("center", highlight_y))
-                highlight_clips.append(hi)
-            except Exception:
-                logger.debug("Falha ao criar highlight karaoke no grupo %s", i // step)
-                continue
+            # Destaque amarelo palavra a palavra, na mesma linha da legenda base.
+            for word_idx, (_, token_s, token_e) in enumerate(chunk_tokens):
+                token_start = max(start, min(end, token_s))
+                token_end = max(token_start + min_hold * 0.55, min(end, token_e))
+                if token_end <= token_start:
+                    continue
+                try:
+                    hi = _make_karaoke_line_clip(
+                        words=chunk_words,
+                        size_px=font_size,
+                        base_color=caption_color,
+                        stroke_color="#000000",
+                        stroke_width=caption_stroke,
+                        active_idx=word_idx,
+                        active_color=highlight_color,
+                        highlight_only=True,
+                        with_bg=False,
+                    ).with_start(token_start).with_duration(token_end - token_start).with_position(("center", y_pos))
+                    highlight_clips.append(hi)
+                except Exception:
+                    logger.debug("Falha ao criar highlight karaoke da palavra %s no chunk %s", word_idx, idx)
+                    continue
 
         if not caption_clips and not highlight_clips:
             return clip
@@ -1234,23 +1523,25 @@ def run_ffmpeg_filtergraph(input_path: Path, filtergraph: str) -> Path | None:
     Aplica um filtergraph FFmpeg no arquivo gerado e devolve novo caminho.
     MantÃ©m Ã¡udio original, reencoda vÃ­deo com codec configurado.
     """
-    if not filtergraph or not shutil.which("ffmpeg"):
+    ffmpeg_bin = _get_ffmpeg_binary()
+    if not filtergraph or not ffmpeg_bin:
         return None
     inp = Path(input_path)
     if not inp.exists():
         return None
     out = inp.with_name(inp.stem + "_ffx.mp4")
+    selected_codec, selected_preset, _ = _resolve_video_encoder(CODEC, VIDEO_PRESET)
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-y",
         "-i",
         str(inp),
         "-vf",
         filtergraph,
         "-c:v",
-        CODEC,
+        selected_codec,
         "-preset",
-        VIDEO_PRESET,
+        selected_preset,
         "-crf",
         "18",
         "-c:a",
