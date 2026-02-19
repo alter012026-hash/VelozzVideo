@@ -209,10 +209,37 @@ def _path_to_web(path: Path | str | None) -> str | None:
         return None
     p = Path(path)
     try:
-        rel = p.relative_to(ROOT)
-        return "/assets/" + rel.as_posix().split("assets/", 1)[-1] if "assets/" in rel.as_posix() else "/assets/" + rel.as_posix()
+        p = p.resolve(strict=False)
     except Exception:
-        return None
+        pass
+
+    # Prefer explicit mapping from assets dir.
+    try:
+        rel_assets = p.relative_to(config.ASSETS_DIR.resolve(strict=False))
+        return f"/assets/{rel_assets.as_posix()}"
+    except Exception:
+        pass
+
+    # Fallback for paths under project root that still include assets/.
+    try:
+        rel_root = p.relative_to(ROOT.resolve(strict=False)).as_posix()
+        if "assets/" in rel_root:
+            return "/assets/" + rel_root.split("assets/", 1)[-1]
+    except Exception:
+        pass
+
+    # Last chance: raw string normalization (Windows/Unix).
+    raw = str(p).replace("\\", "/")
+    lowered = raw.lower()
+    marker = "/assets/"
+    idx = lowered.find(marker)
+    if idx >= 0:
+        return raw[idx:]
+    marker2 = "assets/"
+    idx2 = lowered.find(marker2)
+    if idx2 >= 0:
+        return "/assets/" + raw[idx2 + len(marker2):]
+    return None
 
 
 async def _run_render_task(task_id: str, request: RenderRequest) -> None:

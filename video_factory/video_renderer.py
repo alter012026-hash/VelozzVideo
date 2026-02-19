@@ -462,6 +462,47 @@ class VideoBuilder:
         mixed = CompositeAudioClip([narration, sfx.with_start(0)])
         return self._clip_trim(mixed, 0, scene_duration)
 
+    def _remap_word_timings(
+        self,
+        timings: List[WordTiming],
+        trim_start_s: float,
+        trim_end_s: float,
+        offset_s: float,
+        raw_duration: float,
+    ) -> List[WordTiming]:
+        if not timings:
+            return []
+        max_raw = max(0.05, float(raw_duration or 0.0))
+        trim_start = max(0.0, float(trim_start_s or 0.0))
+        trim_end = max(0.0, float(trim_end_s or 0.0))
+        offset = float(offset_s or 0.0)
+        content_end = max(trim_start + 0.05, max_raw - trim_end)
+
+        out: List[WordTiming] = []
+        for token in timings:
+            try:
+                start_raw = max(0.0, float(token.start))
+                duration_raw = max(0.04, float(token.duration))
+            except Exception:
+                continue
+            end_raw = start_raw + duration_raw
+            if end_raw <= trim_start or start_raw >= content_end:
+                continue
+            start_shifted = start_raw - trim_start + offset
+            end_shifted = end_raw - trim_start + offset
+            if end_shifted <= 0:
+                continue
+            start_shifted = max(0.0, start_shifted)
+            end_shifted = max(start_shifted + 0.04, end_shifted)
+            out.append(
+                WordTiming(
+                    text=token.text,
+                    start=start_shifted,
+                    duration=max(0.04, end_shifted - start_shifted),
+                )
+            )
+        return out
+
     def build_video(
         self,
         visual_paths: List[Path],
@@ -472,6 +513,10 @@ class VideoBuilder:
         scene_effects: Optional[Sequence[str]] = None,
         scene_word_timings: Optional[Sequence[List[WordTiming]]] = None,
         scene_texts: Optional[Sequence[str]] = None,
+        scene_narration_volumes: Optional[Sequence[float]] = None,
+        scene_trim_start_ms: Optional[Sequence[int]] = None,
+        scene_trim_end_ms: Optional[Sequence[int]] = None,
+        scene_audio_offset_ms: Optional[Sequence[int]] = None,
         scene_transitions: Optional[Sequence[str]] = None,
         scene_filters: Optional[Sequence[str]] = None,
         scene_sfx_paths: Optional[Sequence[Optional[Path]]] = None,
@@ -485,8 +530,63 @@ class VideoBuilder:
         clips = []
         overlaps: List[float] = []
         for index, (visual_path, audio_path) in enumerate(zip(visual_paths, audio_paths)):
-            audio_clip = self._audio_scale(AudioFileClip(str(audio_path)), self.narration_volume)
-            scene_duration = float(getattr(audio_clip, "duration", 0) or 0)
+            raw_audio = AudioFileClip(str(audio_path))
+            raw_duration = float(getattr(raw_audio, "duration", 0) or 0)
+            if raw_duration <= 0:
+                logger.warning("Audio bruto da cena %s com duracao invalida; usando fallback.", index + 1)
+                raw_duration = 0.1
+
+            trim_start_ms = scene_trim_start_ms[index] if scene_trim_start_ms and index < len(scene_trim_start_ms) else 0
+            trim_end_ms = scene_trim_end_ms[index] if scene_trim_end_ms and index < len(scene_trim_end_ms) else 0
+            audio_offset_ms = scene_audio_offset_ms[index] if scene_audio_offset_ms and index < len(scene_audio_offset_ms) else 0
+            try:
+                trim_start_s = max(0.0, min(5.0, float(trim_start_ms) / 1000.0))
+            except Exception:
+                trim_start_s = 0.0
+            try:
+                trim_end_s = max(0.0, min(5.0, float(trim_end_ms) / 1000.0))
+            except Exception:
+                trim_end_s = 0.0
+            try:
+                offset_s = max(-3.0, min(3.0, float(audio_offset_ms) / 1000.0))
+            except Exception:
+                offset_s = 0.0
+
+            min_keep = 0.1
+            max_trim_total = max(0.0, raw_duration - min_keep)
+            trim_total = trim_start_s + trim_end_s
+            if trim_total > max_trim_total and max_trim_total > 0:
+                scale = max_trim_total / max(trim_total, 1e-6)
+                trim_start_s *= scale
+                trim_end_s *= scale
+            trimmed_end = max(trim_start_s + min_keep, raw_duration - trim_end_s)
+            trimmed_audio = self._clip_trim(raw_audio, trim_start_s, trimmed_end)
+            trimmed_duration = float(getattr(trimmed_audio, "duration", 0) or 0)
+            if trimmed_duration <= 0:
+                trimmed_audio = self._clip_trim(raw_audio, 0, min_keep)
+                trimmed_duration = float(getattr(trimmed_audio, "duration", 0) or min_keep)
+
+            # Offset negativo antecipa a fala cortando início da narração.
+            if offset_s < 0:
+                cut = min(abs(offset_s), max(0.0, trimmed_duration - min_keep))
+                if cut > 0:
+                    trimmed_audio = self._clip_trim(trimmed_audio, cut, trimmed_duration)
+                    trim_start_s += cut
+                    trimmed_duration = float(getattr(trimmed_audio, "duration", 0) or trimmed_duration)
+                offset_s = 0.0
+
+            scene_narration = scene_narration_volumes[index] if scene_narration_volumes and index < len(scene_narration_volumes) else 1.0
+            try:
+                scene_narration = max(0.0, min(2.0, float(scene_narration)))
+            except Exception:
+                scene_narration = 1.0
+            audio_clip = self._audio_scale(trimmed_audio, self.narration_volume * scene_narration)
+            if offset_s > 0:
+                base_duration = float(getattr(audio_clip, "duration", 0) or 0)
+                scene_duration = base_duration + offset_s
+                audio_clip = CompositeAudioClip([audio_clip.with_start(offset_s)]).with_duration(scene_duration)
+            else:
+                scene_duration = float(getattr(audio_clip, "duration", 0) or 0)
             if scene_duration <= 0:
                 logger.warning("Audio da cena %s com duracao invalida; usando fallback.", index + 1)
                 scene_duration = 0.1
@@ -508,7 +608,14 @@ class VideoBuilder:
             timings = scene_word_timings[index] if scene_word_timings and index < len(scene_word_timings) else []
             if not timings:
                 text = scene_texts[index] if scene_texts and index < len(scene_texts) else ""
-                timings = approximate_word_timings(text, scene_duration)
+                timings = approximate_word_timings(text, max(0.2, raw_duration))
+            timings = self._remap_word_timings(
+                timings=timings,
+                trim_start_s=trim_start_s,
+                trim_end_s=trim_end_s,
+                offset_s=offset_s,
+                raw_duration=raw_duration,
+            )
             if timings:
                 try:
                     video_clip = self._apply_karaoke_overlay(video_clip, timings)
@@ -647,7 +754,94 @@ class VideoBuilder:
                     lines.append(current)
             return "\n".join(lines[:max_lines]).strip()
 
-        def _make_caption(text: str, size_px: int, color: str, stroke_color: str, stroke_width: int) -> TextClip:
+        def _parse_hex_color(value: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+            c = str(value or "").strip()
+            if c.startswith("#"):
+                c = c[1:]
+            if len(c) != 6:
+                return fallback
+            try:
+                return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+            except Exception:
+                return fallback
+
+        def _clip_has_visible_text(candidate: Any) -> bool:
+            try:
+                frame = candidate.get_frame(0)
+                if frame is None or getattr(frame, "size", 0) == 0:
+                    return False
+                arr = np.asarray(frame)
+                if arr.ndim < 2:
+                    return False
+                # Se quase todos pixels forem pretos/transp., tratamos como texto invisível.
+                return bool(np.count_nonzero(arr > 16) > max(30, int(arr.size * 0.0015)))
+            except Exception:
+                return False
+
+        def _make_pil_caption_clip(
+            wrapped_text: str,
+            size_px: int,
+            color: str,
+            stroke_color: str,
+            stroke_width: int,
+            bg_opacity: float,
+        ) -> Any:
+            from PIL import Image, ImageDraw, ImageFont
+
+            font: Any = None
+            for font_name in ("arialbd.ttf", "DejaVuSans-Bold.ttf", "Arial.ttf", "DejaVuSans.ttf"):
+                try:
+                    font = ImageFont.truetype(font_name, size_px)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = ImageFont.load_default()
+
+            probe = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+            probe_draw = ImageDraw.Draw(probe)
+            lines = [line for line in wrapped_text.split("\n") if line.strip()]
+            if not lines:
+                raise RuntimeError("Texto de legenda vazio")
+
+            line_boxes = [probe_draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width) for line in lines]
+            line_widths = [max(1, box[2] - box[0]) for box in line_boxes]
+            line_heights = [max(1, box[3] - box[1]) for box in line_boxes]
+            interline = max(2, int(size_px * 0.18))
+            text_w = min(box_width, max(line_widths))
+            text_h = sum(line_heights) + interline * max(0, len(line_heights) - 1)
+            pad_x = max(10, int(size_px * 0.35))
+            pad_y = max(8, int(size_px * 0.28))
+            canvas_w = min(self.width - 14, max(64, text_w + pad_x * 2))
+            canvas_h = max(28, text_h + pad_y * 2)
+
+            img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            if bg_opacity > 0:
+                draw.rounded_rectangle(
+                    (0, 0, canvas_w - 1, canvas_h - 1),
+                    radius=max(8, int(size_px * 0.3)),
+                    fill=(0, 0, 0, int(255 * max(0.0, min(1.0, bg_opacity)))),
+                )
+
+            fill_rgb = _parse_hex_color(color, (255, 255, 255))
+            stroke_rgb = _parse_hex_color(stroke_color, (0, 0, 0))
+            y = pad_y
+            for line, lw, lh in zip(lines, line_widths, line_heights):
+                x = max(2, int((canvas_w - lw) / 2))
+                draw.text(
+                    (x, y),
+                    line,
+                    font=font,
+                    fill=(*fill_rgb, 255),
+                    stroke_width=stroke_width,
+                    stroke_fill=(*stroke_rgb, 255),
+                )
+                y += lh + interline
+
+            return ImageClip(np.array(img), transparent=True)
+
+        def _make_caption(text: str, size_px: int, color: str, stroke_color: str, stroke_width: int) -> Any:
             wrapped = _wrap_caption_text(text)
             if not wrapped:
                 raise RuntimeError("Texto de legenda vazio")
@@ -670,13 +864,25 @@ class VideoBuilder:
                     kwargs = dict(base_kwargs)
                     if font_name:
                         kwargs["font"] = font_name
-                    return TextClip(**kwargs)
+                    clip_candidate = TextClip(**kwargs)
+                    if _clip_has_visible_text(clip_candidate):
+                        return clip_candidate
                 except Exception as exc:
                     last_exc = exc
                     continue
-            raise last_exc or RuntimeError("Falha ao criar TextClip de karaoke")
+            try:
+                return _make_pil_caption_clip(
+                    wrapped_text=wrapped,
+                    size_px=size_px,
+                    color=color,
+                    stroke_color=stroke_color,
+                    stroke_width=stroke_width,
+                    bg_opacity=0.0,
+                )
+            except Exception:
+                raise last_exc or RuntimeError("Falha ao criar legenda de karaoke")
 
-        def _add_caption_bg(text_clip: TextClip, opacity: Optional[float] = None) -> TextClip:
+        def _add_caption_bg(text_clip: Any, opacity: Optional[float] = None) -> Any:
             bg_opacity = self.caption_bg_opacity if opacity is None else max(0.0, min(1.0, float(opacity)))
             bg_width = min(self.width - 14, max(64, text_clip.w + 22))
             bg_height = max(28, text_clip.h + 16)
@@ -739,8 +945,8 @@ class VideoBuilder:
                     color=caption_color,
                     stroke_color="#000000",
                     stroke_width=2,
-                ).with_start(start).with_duration(end - start)
-                base = _add_caption_bg(base).with_position(("center", y_pos))
+                )
+                base = _add_caption_bg(base).with_start(start).with_duration(end - start).with_position(("center", y_pos))
                 caption_clips.append(base)
             except Exception:
                 logger.debug("Falha ao criar legenda base no chunk %s", idx)
@@ -765,8 +971,8 @@ class VideoBuilder:
                     color=highlight_color,
                     stroke_color="#111111",
                     stroke_width=2,
-                ).with_start(start).with_duration(end - start)
-                hi = _add_caption_bg(hi, opacity=max(0.12, self.caption_bg_opacity * 0.7)).with_position(("center", highlight_y))
+                )
+                hi = _add_caption_bg(hi, opacity=max(0.12, self.caption_bg_opacity * 0.7)).with_start(start).with_duration(end - start).with_position(("center", highlight_y))
                 highlight_clips.append(hi)
             except Exception:
                 logger.debug("Falha ao criar highlight karaoke no grupo %s", i // step)

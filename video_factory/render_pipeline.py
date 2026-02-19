@@ -40,6 +40,10 @@ class RenderScene(BaseModel):
     text: str
     visualPrompt: Optional[str] = None
     localImage: Optional[str] = None
+    narrationVolume: Optional[float] = 1.0
+    trimStartMs: Optional[int] = 0
+    trimEndMs: Optional[int] = 0
+    audioOffsetMs: Optional[int] = 0
     localSfx: Optional[str] = None
     sfxVolume: Optional[float] = 0.35
     animationType: Optional[str] = None
@@ -77,6 +81,10 @@ class SceneAsset:
     text: str
     image_path: Path
     audio_path: Path
+    narration_volume: float
+    trim_start_ms: int
+    trim_end_ms: int
+    audio_offset_ms: int
     sfx_path: Optional[Path]
     sfx_volume: float
     animation: Optional[str]
@@ -238,6 +246,22 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
         image_path = _ensure_visual_path(scene, idx)
         audio_bytes, metadata, audio_ext = await synthesize_to_bytes_with_metadata(scene.text, voice)
         audio_path = _write_asset("audio", audio_bytes, audio_ext or "mp3")
+        try:
+            scene_narration_volume = max(0.0, min(2.0, float(scene.narrationVolume if scene.narrationVolume is not None else 1.0)))
+        except Exception:
+            scene_narration_volume = 1.0
+        try:
+            trim_start_ms = max(0, min(5000, int(scene.trimStartMs if scene.trimStartMs is not None else 0)))
+        except Exception:
+            trim_start_ms = 0
+        try:
+            trim_end_ms = max(0, min(5000, int(scene.trimEndMs if scene.trimEndMs is not None else 0)))
+        except Exception:
+            trim_end_ms = 0
+        try:
+            audio_offset_ms = max(-3000, min(3000, int(scene.audioOffsetMs if scene.audioOffsetMs is not None else 0)))
+        except Exception:
+            audio_offset_ms = 0
         sfx_path = _prepare_scene_sfx(scene.localSfx)
         try:
             sfx_volume = max(0.0, min(2.0, float(scene.sfxVolume if scene.sfxVolume is not None else 0.35)))
@@ -249,6 +273,10 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
                 text=scene.text,
                 image_path=image_path,
                 audio_path=audio_path,
+                narration_volume=scene_narration_volume,
+                trim_start_ms=trim_start_ms,
+                trim_end_ms=trim_end_ms,
+                audio_offset_ms=audio_offset_ms,
                 sfx_path=sfx_path,
                 sfx_volume=sfx_volume,
                 animation=scene.animationType,
@@ -299,6 +327,10 @@ async def render_script(request: RenderRequest, progress_cb: Optional[Callable[[
             scene_effects=[asset.animation for asset in scene_assets],
             scene_word_timings=[asset.word_timings for asset in scene_assets],
             scene_texts=[asset.text for asset in scene_assets],
+            scene_narration_volumes=[asset.narration_volume for asset in scene_assets],
+            scene_trim_start_ms=[asset.trim_start_ms for asset in scene_assets],
+            scene_trim_end_ms=[asset.trim_end_ms for asset in scene_assets],
+            scene_audio_offset_ms=[asset.audio_offset_ms for asset in scene_assets],
             scene_transitions=[asset.transition for asset in scene_assets],
             scene_filters=[asset.color_filter for asset in scene_assets],
             scene_sfx_paths=[asset.sfx_path for asset in scene_assets],

@@ -7,6 +7,10 @@ interface Scene {
   text: string;
   visualPrompt: string;
   localImage?: string;
+  narrationVolume?: number;
+  trimStartMs?: number;
+  trimEndMs?: number;
+  audioOffsetMs?: number;
   localSfx?: string;
   sfxVolume?: number;
   narrationAudio?: string; // Data URL MP3 (preview)
@@ -32,12 +36,25 @@ interface Script {
 }
 
 type WorkflowStep = 'topic' | 'scripting' | 'assets' | 'rendering' | 'done';
+type WorkspacePage = 'studio' | 'timeline';
+type TimelineEditMode = 'pre' | 'post';
 
 interface GridTile {
   id: string;
   row: number;
   col: number;
   dataUrl: string;
+}
+
+interface TimelineDragState {
+  sceneId: string;
+  startSec: number;
+  durationSec: number;
+  originClientX: number;
+  minSec: number;
+  maxSec: number;
+  currentSec: number;
+  pointerId: number;
 }
 
 interface OpenSections {
@@ -68,6 +85,7 @@ interface SessionPayload {
   edgeVoiceId: string;
   currentStep?: WorkflowStep;
   videoUrl?: string | null;
+  timelineEditMode?: TimelineEditMode;
   ollamaHost?: string;
   ollamaModel?: string;
   captionScale?: number;
@@ -168,6 +186,20 @@ const App: React.FC = () => {
   const [topic, setTopic] = useState('');
   const [videoLength, setVideoLength] = useState<'1m' | '5m'>('1m');
   const [currentStep, setCurrentStep] = useState<WorkflowStep>('topic');
+  const [workspacePage, setWorkspacePage] = useState<WorkspacePage>(() => {
+    if (typeof window === 'undefined') return 'studio';
+    return window.location.hash === '#timeline' ? 'timeline' : 'studio';
+  });
+  const [timelineEditMode, setTimelineEditMode] = useState<TimelineEditMode>('pre');
+  const [timelineZoom, setTimelineZoom] = useState<number>(1);
+  const [timelinePlayheadSec, setTimelinePlayheadSec] = useState<number>(0);
+  const [isTimelinePlaying, setIsTimelinePlaying] = useState<boolean>(false);
+  const [timelineSelectedSceneId, setTimelineSelectedSceneId] = useState<string | null>(null);
+  const [showTimelineInspector, setShowTimelineInspector] = useState<boolean>(false);
+  const [showTimelineRenderPanel, setShowTimelineRenderPanel] = useState<boolean>(false);
+  const [timelineTrackHeight, setTimelineTrackHeight] = useState<number>(86);
+  const [timelineDrag, setTimelineDrag] = useState<TimelineDragState | null>(null);
+  const timelineDragSecRef = useRef<number>(0);
   const stepOrder: WorkflowStep[] = ['topic', 'scripting', 'assets', 'rendering', 'done'];
   const transitionOptions = [
     { id: 'fade', label: 'Fade in/out (padrao)' },
@@ -276,6 +308,28 @@ const App: React.FC = () => {
 
   const toggleSection = (key: keyof typeof openSections) =>
     setOpenSections(prev => ({ ...prev, [key]: !prev[key] }));
+
+  useEffect(() => {
+    const onHashChange = () => {
+      setWorkspacePage(window.location.hash === '#timeline' ? 'timeline' : 'studio');
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  useEffect(() => {
+    const currentHash = window.location.hash;
+    const desiredHash = workspacePage === 'timeline' ? '#timeline' : '#studio';
+    if (currentHash !== desiredHash) {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${desiredHash}`);
+    }
+  }, [workspacePage]);
+
+  useEffect(() => {
+    if (!videoUrl) {
+      setTimelineEditMode('pre');
+    }
+  }, [videoUrl]);
 
   const maxScenes = videoLength === '1m' ? 6 : 20; // estimativa: ~10s/cena ou ~15s/cena
   const CARD_W = 288;
@@ -459,7 +513,9 @@ const App: React.FC = () => {
     if (payload.engine) setEngine(payload.engine);
     if (payload.ollamaHost) setOllamaHost(payload.ollamaHost);
     if (payload.ollamaModel) setOllamaModel(payload.ollamaModel);
-    if (payload.videoUrl !== undefined) setVideoUrl(payload.videoUrl || null);
+    if (payload.videoUrl !== undefined) setVideoUrl(toPlayableVideoUrl(payload.videoUrl || null));
+    if (payload.timelineEditMode) setTimelineEditMode(payload.timelineEditMode);
+    else if (payload.videoUrl) setTimelineEditMode('post');
     if (payload.captionScale !== undefined) setCaptionScale(Math.max(0.6, Math.min(1.6, Number(payload.captionScale) || 1)));
     if (payload.captionBg !== undefined) setCaptionBg(Math.max(0, Math.min(1, Number(payload.captionBg) || 0.55)));
     if (payload.captionColor) setCaptionColor(payload.captionColor);
@@ -492,6 +548,10 @@ const App: React.FC = () => {
         ...s,
         id: String((s as any).id ?? idx + 1),
         status: s.status ?? 'completed',
+        narrationVolume: Math.max(0, Math.min(2, Number((s as any).narrationVolume) || 1)),
+        trimStartMs: Math.max(0, Math.min(5000, Math.floor(Number((s as any).trimStartMs) || 0))),
+        trimEndMs: Math.max(0, Math.min(5000, Math.floor(Number((s as any).trimEndMs) || 0))),
+        audioOffsetMs: Math.max(-3000, Math.min(3000, Math.floor(Number((s as any).audioOffsetMs) || 0))),
         transition: s.transition || payload.settings?.defaultTransition || settings.defaultTransition || 'fade',
         filter: s.filter || payload.settings?.defaultFilter || settings.defaultFilter || 'none',
         localSfx: typeof (s as any).localSfx === 'string' ? (s as any).localSfx : undefined,
@@ -681,6 +741,7 @@ const App: React.FC = () => {
       edgeVoiceId,
       currentStep,
       videoUrl,
+      timelineEditMode,
       ollamaHost,
       ollamaModel,
       captionScale,
@@ -725,6 +786,7 @@ const App: React.FC = () => {
     edgeVoiceId,
     currentStep,
     videoUrl,
+    timelineEditMode,
     ollamaHost,
     ollamaModel,
     captionScale,
@@ -761,6 +823,8 @@ const App: React.FC = () => {
 
   const beginSceneDrag = (sceneId: string, e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('button, input, textarea, select, label, a')) return;
     e.preventDefault();
     const pos = scenePositions[sceneId] || { x: CANVAS_PAD, y: CANVAS_PAD };
     dragRef.current = { id: sceneId, startX: e.clientX, startY: e.clientY, origX: pos.x, origY: pos.y };
@@ -796,6 +860,10 @@ const App: React.FC = () => {
       id: newId,
       text: 'Nova narracao',
       visualPrompt: 'Nova descricao',
+      narrationVolume: 1,
+      trimStartMs: 0,
+      trimEndMs: 0,
+      audioOffsetMs: 0,
       sfxVolume: 0.35,
       status: 'completed',
       transition: settings.defaultTransition,
@@ -1311,6 +1379,10 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
         ...s,
         id: String(s.id ?? idx + 1),
         status: 'completed',
+        narrationVolume: Math.max(0, Math.min(2, Number(s.narrationVolume) || 1)),
+        trimStartMs: Math.max(0, Math.min(5000, Math.floor(Number(s.trimStartMs) || 0))),
+        trimEndMs: Math.max(0, Math.min(5000, Math.floor(Number(s.trimEndMs) || 0))),
+        audioOffsetMs: Math.max(-3000, Math.min(3000, Math.floor(Number(s.audioOffsetMs) || 0))),
         localSfx: typeof s.localSfx === 'string' ? s.localSfx : undefined,
         sfxVolume: Math.max(0, Math.min(2, Number(s.sfxVolume) || 0.35)),
         transition: settings.defaultTransition,
@@ -1395,7 +1467,16 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
   };
 
   const duplicateScene = (scene: Scene) => {
-    const newScene = { ...scene, id: Math.random().toString(36).substr(2, 9), narrationAudio: undefined, flowTo: null };
+    const newScene = {
+      ...scene,
+      id: Math.random().toString(36).substr(2, 9),
+      narrationAudio: undefined,
+      narrationVolume: scene.narrationVolume ?? 1,
+      trimStartMs: scene.trimStartMs ?? 0,
+      trimEndMs: scene.trimEndMs ?? 0,
+      audioOffsetMs: scene.audioOffsetMs ?? 0,
+      flowTo: null,
+    };
     setScript(prev => {
       if (!prev) return prev;
       const newScenes = [...prev.scenes];
@@ -1549,6 +1630,10 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
           ...s,
           status: s.status ?? 'completed',
           visualPrompt: String(s.visualPrompt || '').trim() || buildSceneVisualPrompt(String(s.text || ''), idx),
+          narrationVolume: Math.max(0, Math.min(2, Number(s.narrationVolume) || 1)),
+          trimStartMs: Math.max(0, Math.min(5000, Math.floor(Number(s.trimStartMs) || 0))),
+          trimEndMs: Math.max(0, Math.min(5000, Math.floor(Number(s.trimEndMs) || 0))),
+          audioOffsetMs: Math.max(-3000, Math.min(3000, Math.floor(Number(s.audioOffsetMs) || 0))),
           localSfx: typeof s.localSfx === 'string' ? s.localSfx : undefined,
           sfxVolume: Math.max(0, Math.min(2, Number(s.sfxVolume) || 0.35)),
           transition: s.transition || settings.defaultTransition,
@@ -1580,6 +1665,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
     setTopic('');
     setScript(null);
     setVideoUrl(null);
+    setTimelineEditMode('pre');
     setCurrentStep('topic');
     setStatusMessage('');
     setScenePositions({});
@@ -1605,6 +1691,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
     setRenderStage('Iniciando');
     setStatusMessage('Iniciando render com motor local...');
 
+    let producedUrl: string | null = null;
     try {
       const hasLocalAssets = script.scenes.some(s => s.localImage || s.localSfx) || settings.localThemeRef || settings.localBackgroundMusic;
 
@@ -1621,6 +1708,10 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
           text: s.text,
           visualPrompt: s.visualPrompt,
           localImage: s.localImage,
+          narrationVolume: s.narrationVolume ?? 1,
+          trimStartMs: s.trimStartMs ?? 0,
+          trimEndMs: s.trimEndMs ?? 0,
+          audioOffsetMs: s.audioOffsetMs ?? 0,
           localSfx: s.localSfx,
           sfxVolume: s.sfxVolume ?? 0.35,
           animationType: (s as any).animationType,
@@ -1695,12 +1786,15 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
             throw new Error(st.error_log_url ? `${st.error} | log: ${st.error_log_url}` : st.error);
           }
           const rawUrl = st.web_url || st.output || null;
-          const finalUrl = rawUrl && rawUrl.startsWith('/') && apiBase ? `${apiBase}${rawUrl}` : rawUrl;
+          const finalUrl = toPlayableVideoUrl(rawUrl);
+          producedUrl = finalUrl;
           setVideoUrl(finalUrl);
           setRenderProgress(100);
           setRenderStage('Concluído');
           setStatusMessage('Render concluído');
           pushLog(`Render concluído: ${finalUrl || rawUrl || st.output}`, 'info');
+          setTimelineEditMode('post');
+          setWorkspacePage('studio');
           setCurrentStep('done');
         } else {
           const pollDelayMs = staleSeconds >= 20 ? 3000 : 1500;
@@ -1712,10 +1806,12 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       handleAiError(error, 'Vídeo');
     } finally {
       setIsGeneratingVideo(false);
-      if (!videoUrl) setStatusMessage('');
       setRenderStage(prev => (prev === 'Concluído' ? prev : ''));
       setRenderTaskId(null);
-      if (!videoUrl) setRenderProgress(0);
+      if (!producedUrl) {
+        setStatusMessage('');
+        setRenderProgress(0);
+      }
     }
   };
 
@@ -1754,10 +1850,12 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       }
       const data = await response.json();
       const rawUrl = data.web_url || data.output;
-      const finalUrl = rawUrl && rawUrl.startsWith('/') && apiBase ? `${apiBase}${rawUrl}` : rawUrl;
+      const finalUrl = toPlayableVideoUrl(rawUrl);
       setVideoUrl(finalUrl);
       setRenderProgress(100);
       setRenderStage('Concluído');
+      setTimelineEditMode('post');
+      setWorkspacePage('studio');
       setCurrentStep('done');
       pushLog(`Teste de render concluído: ${finalUrl}`, 'info');
       setStatusMessage(`Teste completo. Saída: ${finalUrl}`);
@@ -1773,6 +1871,210 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
   const renderProgressLabel = (renderStage || '').toLowerCase() === 'finalizando'
     ? renderProgress.toFixed(1)
     : renderProgress.toFixed(0);
+  const estimateSceneDuration = (scene: Scene) => {
+    const words = String(scene.text || '').trim().split(/\s+/).filter(Boolean).length;
+    const base = Math.max(1.2, (words / 2.7) + 0.6);
+    const trimStart = Math.max(0, Number(scene.trimStartMs || 0)) / 1000;
+    const trimEnd = Math.max(0, Number(scene.trimEndMs || 0)) / 1000;
+    const offset = Number(scene.audioOffsetMs || 0) / 1000;
+    const adjusted = base - trimStart - trimEnd + Math.max(0, offset);
+    return Math.max(0.8, Math.min(22, adjusted));
+  };
+
+  const toPlayableVideoUrl = (rawUrl?: string | null): string | null => {
+    if (!rawUrl) return null;
+    const raw = String(rawUrl).trim();
+    if (!raw) return null;
+    if (/^https?:\/\//i.test(raw) || raw.startsWith('blob:') || raw.startsWith('data:')) return raw;
+    if (raw.startsWith('/')) return apiBase ? `${apiBase}${raw}` : raw;
+
+    const normalized = raw.replace(/\\/g, '/');
+    const lower = normalized.toLowerCase();
+    const marker = '/assets/';
+    const idx = lower.lastIndexOf(marker);
+    if (idx >= 0) {
+      const webPath = normalized.slice(idx);
+      return apiBase ? `${apiBase}${webPath}` : webPath;
+    }
+    const marker2 = 'assets/';
+    const idx2 = lower.lastIndexOf(marker2);
+    if (idx2 >= 0) {
+      const webPath = `/assets/${normalized.slice(idx2 + marker2.length)}`;
+      return apiBase ? `${apiBase}${webPath}` : webPath;
+    }
+    return raw;
+  };
+  const timelineSceneMeta = useMemo(() => {
+    if (!script) return [];
+    let cursor = 0;
+    return script.scenes.map((scene, idx) => {
+      const durationSec = estimateSceneDuration(scene);
+      const startSec = cursor;
+      cursor += durationSec;
+      return {
+        scene,
+        idx,
+        durationSec,
+        startSec,
+        widthPx: Math.max(220, Math.round(durationSec * 72)),
+      };
+    });
+  }, [script]);
+  const timelineTotalSeconds = useMemo(
+    () => timelineSceneMeta.reduce((acc, item) => acc + item.durationSec, 0),
+    [timelineSceneMeta],
+  );
+  const timelineDurationSafe = Math.max(0.1, timelineTotalSeconds);
+  const timelinePixelsPerSecond = 86 * timelineZoom;
+  const timelineContentWidth = Math.max(980, Math.round(timelineDurationSafe * timelinePixelsPerSecond) + 80);
+  const timelineHeaderHeight = Math.max(42, Math.round(timelineTrackHeight * 0.62));
+  const timelineTickStep = timelineTotalSeconds > 180 ? 10 : timelineTotalSeconds > 90 ? 5 : timelineTotalSeconds > 40 ? 2 : 1;
+  const timelineTicks = useMemo(() => {
+    const ticks: number[] = [];
+    const cap = Math.ceil(timelineDurationSafe / timelineTickStep) * timelineTickStep;
+    for (let t = 0; t <= cap; t += timelineTickStep) ticks.push(t);
+    return ticks;
+  }, [timelineDurationSafe, timelineTickStep]);
+  const selectedTimelineScene = useMemo(
+    () => timelineSceneMeta.find(item => item.scene.id === timelineSelectedSceneId) || timelineSceneMeta[0] || null,
+    [timelineSceneMeta, timelineSelectedSceneId],
+  );
+  const activeTimelineScene = useMemo(() => {
+    const found = timelineSceneMeta.find(
+      item => timelinePlayheadSec >= item.startSec && timelinePlayheadSec < item.startSec + item.durationSec,
+    );
+    return found || timelineSceneMeta[timelineSceneMeta.length - 1] || null;
+  }, [timelineSceneMeta, timelinePlayheadSec]);
+
+  useEffect(() => {
+    if (!script || !script.scenes.length) {
+      setTimelineSelectedSceneId(null);
+      return;
+    }
+    setTimelineSelectedSceneId(prev => script.scenes.some(s => s.id === prev) ? prev : script.scenes[0].id);
+  }, [sceneIdKey]);
+
+  useEffect(() => {
+    setTimelinePlayheadSec(prev => Math.max(0, Math.min(prev, timelineDurationSafe)));
+    if (timelineDurationSafe <= 0.11) setIsTimelinePlaying(false);
+  }, [timelineDurationSafe]);
+
+  useEffect(() => {
+    if (!isTimelinePlaying) return;
+    if (timelineDurationSafe <= 0.11) {
+      setIsTimelinePlaying(false);
+      return;
+    }
+    let rafId = 0;
+    let lastTs = performance.now();
+    const tick = (ts: number) => {
+      const dt = Math.max(0, (ts - lastTs) / 1000);
+      lastTs = ts;
+      setTimelinePlayheadSec(prev => {
+        const next = prev + dt;
+        if (next >= timelineDurationSafe) {
+          setIsTimelinePlaying(false);
+          return timelineDurationSafe;
+        }
+        return next;
+      });
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [isTimelinePlaying, timelineDurationSafe]);
+
+  const formatTimelineTime = (seconds: number) => {
+    const safe = Math.max(0, Number(seconds) || 0);
+    const min = Math.floor(safe / 60);
+    const sec = Math.floor(safe % 60);
+    const tenth = Math.floor((safe % 1) * 10);
+    return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${tenth}`;
+  };
+
+  const seekTimeline = (next: number) => {
+    setIsTimelinePlaying(false);
+    setTimelinePlayheadSec(Math.max(0, Math.min(next, timelineDurationSafe)));
+  };
+
+  const moveSceneToTime = (sceneId: string, targetSec: number) => {
+    if (!script || script.scenes.length <= 1) return;
+    const movingScene = script.scenes.find(s => s.id === sceneId);
+    if (!movingScene) return;
+    const remainingScenes = script.scenes.filter(s => s.id !== sceneId);
+    const durationById = new Map(timelineSceneMeta.map(item => [item.scene.id, item.durationSec]));
+
+    const safeTarget = Math.max(0, Math.min(Number(targetSec) || 0, timelineDurationSafe));
+    let insertIdx = 0;
+    let cursor = 0;
+    for (let i = 0; i < remainingScenes.length; i += 1) {
+      const s = remainingScenes[i];
+      const dur = durationById.get(s.id) ?? estimateSceneDuration(s);
+      const midpoint = cursor + dur / 2;
+      if (safeTarget >= midpoint) insertIdx = i + 1;
+      cursor += dur;
+    }
+
+    const reordered = [
+      ...remainingScenes.slice(0, insertIdx),
+      movingScene,
+      ...remainingScenes.slice(insertIdx),
+    ];
+    setScript({ ...script, scenes: reordered });
+    setTimelineSelectedSceneId(sceneId);
+  };
+
+  const startTimelineClipDrag = (
+    e: React.PointerEvent<HTMLButtonElement>,
+    sceneId: string,
+    startSec: number,
+    durationSec: number,
+  ) => {
+    const canvasEl = e.currentTarget.parentElement as HTMLElement | null;
+    if (!canvasEl) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setIsTimelinePlaying(false);
+    setTimelineSelectedSceneId(sceneId);
+    const maxSec = Math.max(0, timelineDurationSafe - durationSec);
+    const normalizedStart = Math.max(0, Math.min(startSec, maxSec));
+    timelineDragSecRef.current = normalizedStart;
+    setTimelineDrag({
+      sceneId,
+      startSec: normalizedStart,
+      durationSec,
+      originClientX: e.clientX,
+      minSec: 0,
+      maxSec,
+      currentSec: normalizedStart,
+      pointerId: e.pointerId,
+    });
+  };
+
+  useEffect(() => {
+    if (!timelineDrag) return;
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== timelineDrag.pointerId) return;
+      const deltaSec = (ev.clientX - timelineDrag.originClientX) / timelinePixelsPerSecond;
+      const next = Math.max(timelineDrag.minSec, Math.min(timelineDrag.maxSec, timelineDrag.startSec + deltaSec));
+      timelineDragSecRef.current = next;
+      setTimelineDrag(prev => (prev ? { ...prev, currentSec: next } : prev));
+    };
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== timelineDrag.pointerId) return;
+      const finalSec = timelineDragSecRef.current;
+      moveSceneToTime(timelineDrag.sceneId, finalSec);
+      setTimelineDrag(null);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  }, [timelineDrag, timelinePixelsPerSecond, moveSceneToTime]);
 
   return (
     <div className="min-h-screen bg-[#020617] selection:bg-blue-500/30">
@@ -1784,6 +2086,31 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
               <div>
                 <h1 className="text-2xl font-extrabold font-display gradient-text tracking-tighter">VelozzVideo</h1>
                 <p className="text-gray-500 text-[11px] font-bold uppercase tracking-[0.18em]">Fluxo Local + API</p>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setWorkspacePage('studio')}
+                  className={`text-[10px] font-black uppercase px-3 py-2 rounded-xl border transition-all ${
+                    workspacePage === 'studio'
+                      ? 'border-blue-400 bg-blue-500/20 text-white'
+                      : 'border-gray-700 text-gray-300 hover:text-white hover:border-blue-400'
+                  }`}
+                >
+                  Studio
+                </button>
+                <button
+                  onClick={() => {
+                    setTimelineEditMode(videoUrl ? 'post' : 'pre');
+                    setWorkspacePage('timeline');
+                  }}
+                  className={`text-[10px] font-black uppercase px-3 py-2 rounded-xl border transition-all ${
+                    workspacePage === 'timeline'
+                      ? 'border-cyan-400 bg-cyan-500/20 text-white'
+                      : 'border-gray-700 text-gray-300 hover:text-white hover:border-cyan-400'
+                  }`}
+                >
+                  Timeline
+                </button>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <button onClick={restoreSession} className="text-[9px] font-bold uppercase px-2 py-2 rounded-xl border border-green-500/40 text-green-300 hover:text-white hover:border-green-400 transition-all leading-tight text-center">Recuperar sessao</button>
@@ -1834,7 +2161,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
             )}
           </div>
 
-          {script && (
+          {script && workspacePage === 'studio' && (
             <div className="glass p-5 rounded-3xl border-blue-500/10 flex flex-col gap-4 shadow-2xl">
               <h3 className="font-black text-xs text-blue-500 uppercase tracking-[0.3em]">Painel de Render</h3>
 
@@ -2287,6 +2614,474 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
 
         {/* MAIN WORKSPACE */}
         <main className="min-w-0 flex-1 flex flex-col gap-6">
+          {workspacePage === 'timeline' ? (
+            <>
+              <div className="glass p-5 rounded-2xl border-cyan-500/20 shadow-2xl flex flex-col gap-3">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                  <div>
+                    <h2 className="text-sm font-black uppercase tracking-[0.2em] text-cyan-300">Timeline de Edicao</h2>
+                    <p className="text-[11px] text-gray-400">
+                      {timelineEditMode === 'post'
+                        ? 'Pos-producao ativa: ajuste manual e renderize novamente.'
+                        : 'Pre-producao ativa: ajuste narracao, imagem e efeito sonoro por cena.'}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex rounded-xl border border-cyan-500/30 overflow-hidden">
+                      <button
+                        onClick={() => setTimelineEditMode('pre')}
+                        className={`px-3 py-2 text-[10px] font-black uppercase tracking-widest transition-all ${
+                          timelineEditMode === 'pre' ? 'bg-cyan-500/30 text-white' : 'bg-black/50 text-gray-300 hover:text-white'
+                        }`}
+                      >
+                        Pre
+                      </button>
+                      <button
+                        onClick={() => setTimelineEditMode('post')}
+                        className={`px-3 py-2 text-[10px] font-black uppercase tracking-widest transition-all ${
+                          timelineEditMode === 'post' ? 'bg-cyan-500/30 text-white' : 'bg-black/50 text-gray-300 hover:text-white'
+                        }`}
+                      >
+                        Pos
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => setShowTimelineInspector(prev => !prev)}
+                      className={`px-3 py-2 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all ${
+                        showTimelineInspector
+                          ? 'border-cyan-300 bg-cyan-500/20 text-white'
+                          : 'border-gray-700 bg-black/40 text-gray-300 hover:text-white hover:border-cyan-300'
+                      }`}
+                    >
+                      {showTimelineInspector ? 'Ocultar inspector' : 'Mostrar inspector'}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowTimelineInspector(false);
+                        setShowTimelineRenderPanel(false);
+                      }}
+                      className="px-3 py-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 text-[10px] font-black uppercase tracking-widest text-cyan-200 hover:text-white hover:border-cyan-300 transition-all"
+                    >
+                      Foco camadas
+                    </button>
+                    <button
+                      onClick={() => setWorkspacePage('studio')}
+                      className="px-3 py-2 rounded-xl border border-gray-700 bg-black/40 text-[10px] font-black uppercase tracking-widest text-gray-300 hover:text-white hover:border-blue-400 transition-all"
+                    >
+                      Voltar ao studio
+                    </button>
+                    <button
+                      onClick={generateFullVideo}
+                      disabled={!script || isGeneratingVideo}
+                      className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-[10px] font-black uppercase tracking-widest disabled:opacity-50 transition-all"
+                    >
+                      {isGeneratingVideo ? 'Renderizando...' : 'Renderizar do timeline'}
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
+                  <div className="bg-black/30 border border-gray-800 rounded-xl px-3 py-2 text-gray-300">Cenas: <span className="text-white font-mono">{script?.scenes.length || 0}</span></div>
+                  <div className="bg-black/30 border border-gray-800 rounded-xl px-3 py-2 text-gray-300">Duracao estimada: <span className="text-white font-mono">{Math.round(timelineTotalSeconds)}s</span></div>
+                  <div className="bg-black/30 border border-gray-800 rounded-xl px-3 py-2 text-gray-300">Musica global: <span className="text-white font-mono">{settings.localBackgroundMusic ? 'Local' : 'Nenhuma'}</span></div>
+                  <div className="bg-black/30 border border-gray-800 rounded-xl px-3 py-2 text-gray-300">{timelineEditMode === 'post' ? 'Video pronto' : 'Volume musica'}: <span className="text-white font-mono">{timelineEditMode === 'post' ? (videoUrl ? 'SIM' : 'NAO') : `${Math.round(musicVolume * 100)}%`}</span></div>
+                </div>
+              </div>
+
+              {script && (
+                <div className="glass p-5 rounded-2xl border-blue-500/15 flex flex-col gap-4 shadow-2xl">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-black text-xs text-blue-500 uppercase tracking-[0.3em]">Painel de Render</h3>
+                    <button
+                      onClick={() => setShowTimelineRenderPanel(prev => !prev)}
+                      className="px-3 py-2 rounded-xl border border-blue-500/40 bg-blue-500/10 text-[10px] font-black uppercase tracking-widest text-blue-200 hover:text-white hover:border-blue-300 transition-all"
+                    >
+                      {showTimelineRenderPanel ? 'Ocultar' : 'Expandir'}
+                    </button>
+                  </div>
+                  {!showTimelineRenderPanel && (
+                    <p className="text-[10px] text-gray-500">Painel recolhido para ampliar área de trabalho das camadas.</p>
+                  )}
+
+                  {showTimelineRenderPanel && (
+                  <>
+                  <div className="pt-1 text-[11px] space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-gray-500 font-mono">Roteiro</span>
+                      <div className="flex gap-2">
+                        <label className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 cursor-pointer hover:border-blue-500/50 transition-all">
+                          Importar
+                          <input type="file" accept="application/json" className="hidden" onChange={(e) => e.target.files?.[0] && handleImportScript(e.target.files[0])} />
+                        </label>
+                        <button onClick={downloadScript} disabled={!script} className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-40 transition-all">Exportar</button>
+                      </div>
+                    </div>
+                    {importError && <p className="text-xs text-red-400">{importError}</p>}
+                  </div>
+
+                  <div className="pt-3 border-t border-gray-800 text-[11px] space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-gray-500 font-mono">Limpar cache</span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min={1}
+                          className="w-16 bg-black/40 border border-gray-800 rounded-lg px-2 py-1 text-[10px] text-white outline-none focus:border-blue-500/40"
+                          value={cleanupAgeDays}
+                          onChange={(e) => setCleanupAgeDays(Math.max(1, Number(e.target.value) || 7))}
+                          title="Dias maximos para manter assets"
+                        />
+                        <button
+                          onClick={cleanupCache}
+                          disabled={isCleaningCache}
+                          className="text-[9px] font-bold px-3 py-2 bg-gray-900 rounded-xl border border-gray-800 text-gray-400 hover:text-white hover:border-blue-500/50 disabled:opacity-50 transition-all"
+                        >
+                          {isCleaningCache ? 'Limpando...' : 'Executar'}
+                        </button>
+                      </div>
+                    </div>
+                    {cleanupResult && <p className="text-[10px] text-green-300">{cleanupResult}</p>}
+                  </div>
+
+                  <div className="pt-3 border-t border-gray-800 text-[11px] space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-gray-500 font-mono">Volumes</span>
+                      <div className="flex-1 grid grid-cols-2 gap-3">
+                        <label className="flex flex-col gap-1 text-[10px] text-gray-400">
+                          Musica {Math.round(musicVolume * 100)}%
+                          <input type="range" min={0} max={1} step={0.05} value={musicVolume} onChange={(e)=>setMusicVolume(Number(e.target.value))} />
+                        </label>
+                        <label className="flex flex-col gap-1 text-[10px] text-gray-400">
+                          Narracao {Math.round(narrationVolume * 100)}%
+                          <input type="range" min={0.3} max={1.5} step={0.05} value={narrationVolume} onChange={(e)=>setNarrationVolume(Number(e.target.value))} />
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-gray-500 font-mono">Legendas</span>
+                      <div className="flex-1 space-y-2">
+                        <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-400">
+                          <label className="flex flex-col gap-1">
+                            Tamanho {captionScale.toFixed(2)}x
+                            <input type="range" min={0.7} max={1.4} step={0.05} value={captionScale} onChange={(e)=>setCaptionScale(Number(e.target.value))} />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            Opacidade BG {Math.round(captionBg*100)}%
+                            <input type="range" min={0} max={1} step={0.05} value={captionBg} onChange={(e)=>setCaptionBg(Number(e.target.value))} />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            Posicao Y {captionY}%
+                            <input type="range" min={60} max={90} step={1} value={captionY} onChange={(e)=>setCaptionY(Number(e.target.value))} />
+                          </label>
+                        </div>
+                        <div className="flex items-center gap-3 text-[10px] text-gray-300">
+                          <span>Cor</span>
+                          <input type="color" value={captionColor} onChange={(e)=>setCaptionColor(e.target.value)} />
+                          <span>Destaque</span>
+                          <input type="color" value={captionHighlight} onChange={(e)=>setCaptionHighlight(e.target.value)} />
+                        </div>
+                        <div className="mt-1 p-3 rounded-xl border border-gray-800 bg-black/40 text-center text-[11px]">
+                          <span style={{backgroundColor:`rgba(0,0,0,${captionBg})`, padding:'6px 10px', borderRadius:'10px', display:'inline-block', color: captionColor}}>
+                            LEGENDAS PREVIA <span style={{color: captionHighlight}}>DESTAQUE</span>
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-gray-500 font-mono">Efeitos</span>
+                      <div className="flex-1 grid grid-cols-2 gap-3 text-[10px] text-gray-400">
+                        <label className="flex flex-col gap-1">
+                          Forca de cor {colorStrength.toFixed(2)}
+                          <input type="range" min={0} max={1.2} step={0.05} value={colorStrength} onChange={(e)=>setColorStrength(Number(e.target.value))} />
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          Duracao de transicao {transitionDuration.toFixed(2)}s
+                          <input type="range" min={0.2} max={1.2} step={0.05} value={transitionDuration} onChange={(e)=>setTransitionDuration(Number(e.target.value))} />
+                        </label>
+                        <label className="flex flex-col gap-1 col-span-2">
+                          Escala da imagem {imageScale.toFixed(2)}x
+                          <input type="range" min={0.8} max={1.2} step={0.02} value={imageScale} onChange={(e)=>setImageScale(Number(e.target.value))} />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                  </>
+                  )}
+                </div>
+              )}
+
+              {!script ? (
+                <div className="glass p-8 rounded-2xl border-white/10 text-center text-gray-400">
+                  Gere ou importe um roteiro para editar na timeline.
+                </div>
+              ) : (
+                <div className={`grid grid-cols-1 gap-4 ${showTimelineInspector ? 'xl:grid-cols-[330px_minmax(0,1fr)]' : 'xl:grid-cols-1'}`}>
+                  {showTimelineInspector && (
+                  <div className="glass p-4 rounded-2xl border-white/10 shadow-2xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-gray-300">Inspector</h3>
+                      <span className="text-[10px] font-mono text-cyan-300">
+                        {selectedTimelineScene ? `Cena ${selectedTimelineScene.idx + 1}` : '--'}
+                      </span>
+                    </div>
+                    {selectedTimelineScene ? (
+                      <div className="space-y-3">
+                        <div className="rounded-xl border border-gray-800 bg-black/40 overflow-hidden h-36">
+                          {timelineEditMode === 'post' && videoUrl ? (
+                            <video key={`tl-preview-${videoUrl}`} controls className="w-full h-full object-contain">
+                              <source src={videoUrl} type="video/mp4" />
+                            </video>
+                          ) : selectedTimelineScene.scene.localImage ? (
+                            <img src={selectedTimelineScene.scene.localImage} className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center text-[11px] text-gray-500">Sem imagem da cena</div>
+                          )}
+                        </div>
+                        <div className="text-[10px] text-gray-400 font-mono">
+                          Inicio {formatTimelineTime(selectedTimelineScene.startSec)} | Fim {formatTimelineTime(selectedTimelineScene.startSec + selectedTimelineScene.durationSec)}
+                        </div>
+                        <textarea
+                          className="w-full h-32 bg-black/50 border border-gray-800 rounded-xl p-3 text-[11px] text-gray-200 outline-none focus:border-blue-500/40 resize-none"
+                          value={selectedTimelineScene.scene.text}
+                          onChange={(e) => updateScene(selectedTimelineScene.scene.id, { text: e.target.value })}
+                        />
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            onClick={() => generateNarration(selectedTimelineScene.scene.id, selectedTimelineScene.scene.text)}
+                            disabled={isGeneratingNarration === selectedTimelineScene.scene.id}
+                            className="text-[10px] px-2 py-2 rounded-lg border border-purple-500/40 text-purple-200 hover:text-white hover:border-purple-300 transition-all disabled:opacity-50"
+                          >
+                            {isGeneratingNarration === selectedTimelineScene.scene.id ? 'Gerando...' : 'Gerar voz'}
+                          </button>
+                          <button
+                            onClick={() => selectedTimelineScene.scene.narrationAudio && playNarration(selectedTimelineScene.scene.narrationAudio)}
+                            disabled={!selectedTimelineScene.scene.narrationAudio}
+                            className="text-[10px] px-2 py-2 rounded-lg border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 transition-all disabled:opacity-40"
+                          >
+                            Ouvir narracao
+                          </button>
+                        </div>
+                        <label className="block text-[10px] text-gray-400">
+                          Volume narracao {Math.round((selectedTimelineScene.scene.narrationVolume ?? 1) * 100)}%
+                          <input
+                            type="range"
+                            min={0}
+                            max={1.8}
+                            step={0.05}
+                            value={selectedTimelineScene.scene.narrationVolume ?? 1}
+                            onChange={(e) => updateScene(selectedTimelineScene.scene.id, { narrationVolume: Number(e.target.value) })}
+                          />
+                        </label>
+                        <label className="block text-[10px] text-gray-400">
+                          Trim inicio {Math.round(selectedTimelineScene.scene.trimStartMs ?? 0)}ms
+                          <input
+                            type="range"
+                            min={0}
+                            max={2500}
+                            step={50}
+                            value={selectedTimelineScene.scene.trimStartMs ?? 0}
+                            onChange={(e) => updateScene(selectedTimelineScene.scene.id, { trimStartMs: Number(e.target.value) })}
+                          />
+                        </label>
+                        <label className="block text-[10px] text-gray-400">
+                          Trim fim {Math.round(selectedTimelineScene.scene.trimEndMs ?? 0)}ms
+                          <input
+                            type="range"
+                            min={0}
+                            max={2500}
+                            step={50}
+                            value={selectedTimelineScene.scene.trimEndMs ?? 0}
+                            onChange={(e) => updateScene(selectedTimelineScene.scene.id, { trimEndMs: Number(e.target.value) })}
+                          />
+                        </label>
+                        <label className="block text-[10px] text-gray-400">
+                          Offset audio {Math.round(selectedTimelineScene.scene.audioOffsetMs ?? 0)}ms
+                          <input
+                            type="range"
+                            min={-1500}
+                            max={1500}
+                            step={50}
+                            value={selectedTimelineScene.scene.audioOffsetMs ?? 0}
+                            onChange={(e) => updateScene(selectedTimelineScene.scene.id, { audioOffsetMs: Number(e.target.value) })}
+                          />
+                        </label>
+                        <div className="grid grid-cols-3 gap-2">
+                          <label className="text-[10px] px-2 py-2 rounded-lg border border-amber-500/40 text-amber-200 hover:text-white hover:border-amber-300 transition-all cursor-pointer text-center">
+                            Upload SFX
+                            <input type="file" className="hidden" accept="audio/*" onChange={(e) => e.target.files?.[0] && handleFileUpload('scene_sfx', selectedTimelineScene.scene.id, e.target.files[0])} />
+                          </label>
+                          <button
+                            onClick={() => selectedTimelineScene.scene.localSfx && playNarration(selectedTimelineScene.scene.localSfx)}
+                            disabled={!selectedTimelineScene.scene.localSfx}
+                            className="text-[10px] px-2 py-2 rounded-lg border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 transition-all disabled:opacity-40"
+                          >
+                            Ouvir SFX
+                          </button>
+                          <button
+                            onClick={() => updateScene(selectedTimelineScene.scene.id, { localSfx: undefined })}
+                            disabled={!selectedTimelineScene.scene.localSfx}
+                            className="text-[10px] px-2 py-2 rounded-lg border border-red-500/40 text-red-300 hover:text-white hover:border-red-300 transition-all disabled:opacity-40"
+                          >
+                            Remover
+                          </button>
+                        </div>
+                        <label className="block text-[10px] text-gray-400">
+                          Volume SFX {Math.round((selectedTimelineScene.scene.sfxVolume ?? 0.35) * 100)}%
+                          <input
+                            type="range"
+                            min={0}
+                            max={1.2}
+                            step={0.05}
+                            value={selectedTimelineScene.scene.sfxVolume ?? 0.35}
+                            onChange={(e) => updateScene(selectedTimelineScene.scene.id, { sfxVolume: Number(e.target.value) })}
+                          />
+                        </label>
+                        <label className="inline-flex w-full justify-center cursor-pointer text-[10px] px-2 py-2 rounded-lg border border-blue-500/40 text-blue-200 hover:text-white hover:border-blue-300 transition-all">
+                          Trocar imagem
+                          <input type="file" className="hidden" accept="image/*" onChange={(e) => e.target.files?.[0] && handleFileUpload('scene_image', selectedTimelineScene.scene.id, e.target.files[0])} />
+                        </label>
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-gray-500">Selecione um clip na timeline.</div>
+                    )}
+                  </div>
+                  )}
+
+                  <div className="glass p-4 rounded-2xl border-white/10 shadow-2xl overflow-hidden">
+                    <div className="flex flex-wrap gap-2 items-center mb-3">
+                      <button
+                        onClick={() => setIsTimelinePlaying(prev => !prev)}
+                        className="px-3 py-2 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-[10px] font-black uppercase tracking-widest text-cyan-200 hover:text-white hover:border-cyan-300 transition-all"
+                      >
+                        {isTimelinePlaying ? 'Pausar' : 'Play'}
+                      </button>
+                      <button
+                        onClick={() => seekTimeline(activeTimelineScene ? activeTimelineScene.startSec : 0)}
+                        className="px-3 py-2 rounded-lg border border-gray-700 bg-black/40 text-[10px] font-black uppercase tracking-widest text-gray-300 hover:text-white hover:border-blue-400 transition-all"
+                      >
+                        Ir para cena
+                      </button>
+                      <button
+                        onClick={() => seekTimeline(0)}
+                        className="px-3 py-2 rounded-lg border border-gray-700 bg-black/40 text-[10px] font-black uppercase tracking-widest text-gray-300 hover:text-white hover:border-blue-400 transition-all"
+                      >
+                        Início
+                      </button>
+                      <div className="text-[11px] font-mono text-gray-300 ml-auto">
+                        {formatTimelineTime(timelinePlayheadSec)} / {formatTimelineTime(timelineDurationSafe)}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 mb-4">
+                      <input
+                        type="range"
+                        min={0}
+                        max={timelineDurationSafe}
+                        step={0.01}
+                        value={timelinePlayheadSec}
+                        onChange={(e) => seekTimeline(Number(e.target.value))}
+                        className="flex-1 accent-cyan-400"
+                      />
+                      <div className="w-40 flex items-center gap-2">
+                        <span className="text-[10px] text-gray-500 uppercase">Zoom</span>
+                        <input
+                          type="range"
+                          min={0.5}
+                          max={3}
+                          step={0.1}
+                          value={timelineZoom}
+                          onChange={(e) => setTimelineZoom(Number(e.target.value))}
+                          className="flex-1 accent-cyan-400"
+                        />
+                      </div>
+                      <div className="w-44 flex items-center gap-2">
+                        <span className="text-[10px] text-gray-500 uppercase">Altura</span>
+                        <input
+                          type="range"
+                          min={64}
+                          max={140}
+                          step={2}
+                          value={timelineTrackHeight}
+                          onChange={(e) => setTimelineTrackHeight(Number(e.target.value))}
+                          className="flex-1 accent-cyan-400"
+                        />
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-gray-500 mb-3">Arraste os clips para reordenar as cenas na timeline. Use zoom/altura para trabalhar melhor com camadas de áudio e imagem.</p>
+
+                    <div className="overflow-x-auto overflow-y-auto custom-scrollbar pb-2 max-h-[72vh]">
+                      <div className="min-w-max space-y-2">
+                        <div className="flex items-end gap-2">
+                          <div className="w-24 text-[10px] uppercase tracking-widest text-gray-500">Tempo</div>
+                          <div className="relative rounded-lg border border-gray-800 bg-black/50" style={{ width: `${timelineContentWidth}px`, height: `${timelineHeaderHeight}px` }}>
+                            {timelineTicks.map(t => (
+                              <div key={`tick-${t}`} className="absolute top-0 bottom-0 border-l border-white/10" style={{ left: `${Math.round(t * timelinePixelsPerSecond)}px` }}>
+                                <span className="absolute top-1 left-1 text-[9px] text-gray-500 font-mono">{formatTimelineTime(t)}</span>
+                              </div>
+                            ))}
+                            <div className="absolute top-0 bottom-0 w-[2px] bg-pink-400/80" style={{ left: `${Math.round(timelinePlayheadSec * timelinePixelsPerSecond)}px` }}></div>
+                          </div>
+                        </div>
+
+                        {[{ id: 'video', label: 'Video' }, { id: 'narration', label: 'Narracao' }, { id: 'sfx', label: 'SFX' }].map(track => (
+                          <div key={track.id} className="flex items-stretch gap-2">
+                            <div className="w-24 rounded-lg border border-gray-800 bg-black/40 px-2 flex items-center text-[10px] uppercase tracking-widest text-gray-500" style={{ height: `${timelineTrackHeight}px` }}>{track.label}</div>
+                            <div
+                              className="relative rounded-lg border border-gray-800 bg-black/40"
+                              style={{ width: `${timelineContentWidth}px`, height: `${timelineTrackHeight}px` }}
+                              onClick={(e) => {
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                const sec = (e.clientX - rect.left) / timelinePixelsPerSecond;
+                                seekTimeline(sec);
+                              }}
+                            >
+                              {timelineSceneMeta.map(({ scene, idx, startSec, durationSec }) => {
+                                const isDraggingScene = timelineDrag?.sceneId === scene.id;
+                                const renderStartSec = isDraggingScene ? (timelineDrag?.currentSec ?? startSec) : startSec;
+                                const left = Math.round(renderStartSec * timelinePixelsPerSecond);
+                                const width = Math.max(52, Math.round(durationSec * timelinePixelsPerSecond) - 2);
+                                const selected = scene.id === timelineSelectedSceneId;
+                                const muted = track.id === 'video'
+                                  ? !scene.localImage
+                                  : track.id === 'narration'
+                                    ? !String(scene.text || '').trim()
+                                    : !scene.localSfx;
+                                const tone = track.id === 'video'
+                                  ? 'from-blue-500/50 to-cyan-500/40 border-blue-400/40'
+                                  : track.id === 'narration'
+                                    ? 'from-purple-500/50 to-fuchsia-500/40 border-purple-400/40'
+                                    : 'from-amber-500/50 to-orange-500/40 border-amber-400/40';
+                                return (
+                                  <button
+                                    key={`${track.id}-${scene.id}`}
+                                    onPointerDown={(e) => startTimelineClipDrag(e, scene.id, startSec, durationSec)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setTimelineSelectedSceneId(scene.id);
+                                      seekTimeline(startSec);
+                                    }}
+                                    className={`absolute top-1.5 bottom-1.5 rounded-md border bg-gradient-to-r px-2 text-left transition-all cursor-grab active:cursor-grabbing ${tone} ${selected ? 'ring-1 ring-white/60' : ''} ${muted ? 'opacity-30' : 'opacity-95 hover:opacity-100'} ${isDraggingScene ? 'z-20 shadow-[0_0_0_1px_rgba(255,255,255,0.5)]' : ''}`}
+                                    style={{ left: `${left}px`, width: `${width}px` }}
+                                  >
+                                    <div className="text-[9px] font-black uppercase tracking-widest text-white/95">C{idx + 1}</div>
+                                    <div className="text-[9px] font-mono text-white/80">
+                                      {durationSec.toFixed(1)}s{track.id === 'narration' ? ` | T${Math.round(scene.trimStartMs ?? 0)}/${Math.round(scene.trimEndMs ?? 0)}ms` : ''}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                              <div className="absolute top-0 bottom-0 w-[2px] bg-pink-400/80 pointer-events-none" style={{ left: `${Math.round(timelinePlayheadSec * timelinePixelsPerSecond)}px` }}></div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
           <div className="glass p-5 rounded-2xl border-white/5 shadow-2xl flex flex-col lg:flex-row gap-4 items-stretch">
             <div className="flex-1">
               <input
@@ -2441,6 +3236,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
                                 <span className="text-[9px] px-2 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-100">{transitionValue}</span>
                                 <span className="text-[9px] px-2 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-100">{filterValue}</span>
                                 <button
+                                  onPointerDown={(e) => e.stopPropagation()}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     toggleSceneCollapse(scene.id);
@@ -2783,6 +3579,15 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
                   {videoUrl && (
                     <div className="flex items-center gap-2">
                       <button onClick={() => setVideoUrl(null)} className="px-3 py-2 rounded-xl border border-gray-800 bg-black/40 text-[10px] font-black uppercase tracking-widest text-gray-300 hover:text-white hover:border-blue-500/40 transition-all">Reiniciar</button>
+                      <button
+                        onClick={() => {
+                          setTimelineEditMode('post');
+                          setWorkspacePage('timeline');
+                        }}
+                        className="px-3 py-2 rounded-xl border border-cyan-500/40 bg-cyan-500/10 text-[10px] font-black uppercase tracking-widest text-cyan-200 hover:text-white hover:border-cyan-300 transition-all"
+                      >
+                        Reeditar timeline
+                      </button>
                       <a href={videoUrl} download="velozz_render.mp4" className="px-4 py-2 rounded-xl bg-white text-black text-[10px] font-black uppercase tracking-widest hover:bg-gray-200 transition-all shadow-xl active:scale-95">Baixar MP4</a>
                     </div>
                   )}
@@ -2790,7 +3595,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
 
                 <div className={`w-full bg-black rounded-2xl border border-gray-800 overflow-hidden ${format === '16:9' ? 'aspect-video' : 'aspect-[9/16] max-w-[420px] mx-auto'}`}>
                   {videoUrl ? (
-                    <video controls className="w-full h-full object-contain">
+                    <video key={videoUrl} controls preload="metadata" playsInline className="w-full h-full object-contain">
                       <source src={videoUrl} type="video/mp4" />
                     </video>
                   ) : (
@@ -2803,6 +3608,8 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
               </div>
 
             </div>
+          )}
+            </>
           )}
         </main>
       </div>
