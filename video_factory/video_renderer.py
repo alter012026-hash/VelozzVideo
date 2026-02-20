@@ -40,6 +40,7 @@ from video_factory.config import (
     CODEC,
     FADE_DURATION,
     FPS,
+    MAX_UPSCALE,
     TRANSITION_DURATION,
     TRANSITION_STYLE,
     TRANSITION_TYPES,
@@ -49,6 +50,7 @@ from video_factory.config import (
     VIDEO_THREADS,
     KARAOKE_MAX_HIGHLIGHTS,
     KARAOKE_MIN_HOLD,
+    GPU_ENCODER_PREFERENCE,
 )
 from video_factory.tts_metadata import WordTiming, approximate_word_timings
 from video_factory import config
@@ -226,7 +228,8 @@ def _resolve_video_encoder(codec_pref: str, preset_pref: str) -> tuple[str, str,
     available = _list_available_encoders(ffmpeg_bin)
 
     if preferred_codec in {"auto", "gpu", "hardware", "hw"}:
-        candidates = [*list(_GPU_ENCODERS), "libx264"]
+        pref_list = [c for c in GPU_ENCODER_PREFERENCE if c] or list(_GPU_ENCODERS)
+        candidates = [*pref_list, "libx264"]
     elif preferred_codec in _GPU_ENCODERS:
         candidates = [preferred_codec, "libx264"]
     else:
@@ -311,6 +314,7 @@ class VideoBuilder:
         self.transition_duration = (
             float(transition_duration) if transition_duration is not None else float(TRANSITION_DURATION or FADE_DURATION)
         )
+        self.max_upscale = max(1.0, float(MAX_UPSCALE or 1.35))
         self.color_filter = (color_filter or "").lower()
         self.color_strength = max(0.0, min(1.5, color_strength))
         self.image_scale = max(0.8, min(1.2, float(image_scale)))
@@ -425,6 +429,89 @@ class VideoBuilder:
         base = self.transition_duration or FADE_DURATION
         return max(0.05, min(base, clip_duration * 0.25))
 
+    def _clamp_scale(self, factor: float) -> float:
+        return max(1.0, min(self.max_upscale, float(factor)))
+
+    def _apply_transition_zoom(self, clip: Any, duration: float, mode: str = "push") -> Any:
+        mode = (mode or "push").lower()
+
+        def effect(gf, t):
+            frame = gf(t)
+            total = max(duration * 2.0, float(getattr(clip, "duration", 0) or 0))
+            strength = 0.0
+            if t < duration:
+                progress = max(0.0, min(1.0, t / max(duration, 1e-6)))
+                strength = progress if mode == "push" else (1.0 - progress)
+            elif t > (total - duration):
+                progress = max(0.0, min(1.0, (t - (total - duration)) / max(duration, 1e-6)))
+                strength = (1.0 - progress) if mode == "push" else progress
+
+            if strength <= 0:
+                return frame
+
+            amp = 0.18
+            factor = self._clamp_scale(1.0 + amp * strength)
+            from PIL import Image
+
+            pil_img = Image.fromarray(frame)
+            new_w = max(frame.shape[1], int(pil_img.width * factor))
+            new_h = max(frame.shape[0], int(pil_img.height * factor))
+            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+            x = (pil_img.width - frame.shape[1]) // 2
+            y = (pil_img.height - frame.shape[0]) // 2
+            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_transition_whip(self, clip: Any, duration: float, direction: str = "left") -> Any:
+        sign = -1 if str(direction).lower() == "left" else 1
+
+        def effect(gf, t):
+            frame = gf(t).astype(np.float32)
+            total = max(duration * 2.0, float(getattr(clip, "duration", 0) or 0))
+            edge = 0.0
+            if t < duration:
+                edge = 1.0 - max(0.0, min(1.0, t / max(duration, 1e-6)))
+            elif t > (total - duration):
+                edge = max(0.0, min(1.0, (t - (total - duration)) / max(duration, 1e-6)))
+            if edge <= 0:
+                return frame.astype(np.uint8)
+
+            h, w = frame.shape[:2]
+            shift = int(sign * edge * w * 0.18)
+            shifted = np.roll(frame, shift, axis=1)
+            trail = np.roll(frame, int(shift * 0.45), axis=1)
+            mix = shifted * 0.65 + trail * 0.25 + frame * 0.10
+            darken = max(0.0, min(0.5, edge * 0.28))
+            mix *= (1.0 - darken)
+            return np.clip(mix, 0, 255).astype(np.uint8)
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_transition_flash(self, clip: Any, duration: float, style: str = "white") -> Any:
+        style = (style or "white").lower()
+
+        def effect(gf, t):
+            frame = gf(t).astype(np.float32)
+            total = max(duration * 2.0, float(getattr(clip, "duration", 0) or 0))
+            edge = 0.0
+            if t < duration:
+                edge = 1.0 - max(0.0, min(1.0, t / max(duration, 1e-6)))
+            elif t > (total - duration):
+                edge = max(0.0, min(1.0, (t - (total - duration)) / max(duration, 1e-6)))
+            if edge <= 0:
+                return frame.astype(np.uint8)
+
+            if style == "black":
+                alpha = min(0.92, edge * 0.88)
+                mixed = frame * (1.0 - alpha)
+            else:
+                alpha = min(0.92, edge * 0.82)
+                mixed = frame * (1.0 - alpha) + (255.0 * alpha)
+            return np.clip(mixed, 0, 255).astype(np.uint8)
+
+        return clip.transform(effect, keep_duration=True)
+
     def _apply_transition_effects(self, clip: Any, index: int, transition_override: Optional[str] = None) -> tuple[Any, float]:
         transition = (transition_override or self._pick_transition(index) or "none").lower()
         duration = self._transition_duration(getattr(clip, "duration", 0) or 0)
@@ -449,6 +536,24 @@ class VideoBuilder:
                     FadeIn(min(0.2, duration)),
                     FadeOut(min(0.2, duration)),
                 ]
+        elif transition == "zoom_in":
+            clip = self._apply_transition_zoom(clip, duration, mode="push")
+            video_effects = [CrossFadeIn(duration), CrossFadeOut(duration)]
+        elif transition == "zoom_out":
+            clip = self._apply_transition_zoom(clip, duration, mode="pull")
+            video_effects = [CrossFadeIn(duration), CrossFadeOut(duration)]
+        elif transition == "whip_left":
+            clip = self._apply_transition_whip(clip, duration, direction="left")
+            video_effects = [CrossFadeIn(duration), CrossFadeOut(duration)]
+        elif transition == "whip_right":
+            clip = self._apply_transition_whip(clip, duration, direction="right")
+            video_effects = [CrossFadeIn(duration), CrossFadeOut(duration)]
+        elif transition == "flash_white":
+            clip = self._apply_transition_flash(clip, duration, style="white")
+            video_effects = [CrossFadeIn(duration), CrossFadeOut(duration)]
+        elif transition == "dip_black":
+            clip = self._apply_transition_flash(clip, duration, style="black")
+            video_effects = [FadeIn(duration), FadeOut(duration)]
         else:
             video_effects = [FadeIn(duration), FadeOut(duration)]
 
@@ -904,6 +1009,13 @@ class VideoBuilder:
         font_size = max(24, int(self.height * 0.031 * self.caption_font_scale))
         box_width = int(self.width * 0.84)
         y_pos = int(self.height * self.caption_y_pct)
+        safe_top_margin = max(8, int(self.height * 0.02))
+        safe_bottom_margin = max(18, int(self.height * 0.05))
+
+        def _safe_caption_y(clip_h: int) -> int:
+            height = max(1, int(clip_h or 1))
+            max_y = max(safe_top_margin, self.height - safe_bottom_margin - height)
+            return max(safe_top_margin, min(y_pos, max_y))
 
         def _ensure_visible_color(color: str, fallback: str = "#FFFFFF") -> str:
             c = str(color or "").strip()
@@ -1238,7 +1350,8 @@ class VideoBuilder:
                     stroke_width=caption_stroke,
                     with_bg=True,
                 )
-                base = base.with_start(start).with_duration(end - start).with_position(("center", y_pos))
+                line_y = _safe_caption_y(int(getattr(base, "h", 0) or 0))
+                base = base.with_start(start).with_duration(end - start).with_position(("center", line_y))
                 caption_clips.append(base)
             except Exception:
                 logger.debug("Falha ao criar legenda base no chunk %s", idx)
@@ -1261,7 +1374,7 @@ class VideoBuilder:
                         active_color=highlight_color,
                         highlight_only=True,
                         with_bg=False,
-                    ).with_start(token_start).with_duration(token_end - token_start).with_position(("center", y_pos))
+                    ).with_start(token_start).with_duration(token_end - token_start).with_position(("center", line_y))
                     highlight_clips.append(hi)
                 except Exception:
                     logger.debug("Falha ao criar highlight karaoke da palavra %s no chunk %s", word_idx, idx)
@@ -1340,6 +1453,8 @@ class VideoBuilder:
 
     def _apply_animation(self, clip: ImageClip, animation_type: Optional[str]) -> ImageClip:
         animation_type = (animation_type or "").lower()
+        if animation_type in {"none", "off", "static"}:
+            return clip
         if animation_type == "zoom_out":
             return self._apply_zoom(clip, zoom_in=False)
         if animation_type == "zoom_in_fast":
@@ -1379,6 +1494,16 @@ class VideoBuilder:
                 return pulse_fn(clip)
             logger.warning("Animacao 'pulse' indisponivel nesta versao; usando zoom_in como fallback.")
             return self._apply_zoom(clip, zoom_in=True)
+        if animation_type == "dolly_left":
+            return self._apply_dolly(clip, direction="left")
+        if animation_type == "dolly_right":
+            return self._apply_dolly(clip, direction="right")
+        if animation_type == "orbit":
+            return self._apply_orbit(clip)
+        if animation_type == "handheld":
+            return self._apply_handheld(clip)
+        if animation_type == "drift_diag":
+            return self._apply_drift_diag(clip)
         return self._apply_zoom(clip, zoom_in=True)
 
     def _apply_zoom(self, clip: ImageClip, zoom_in: bool = True, intensity: float = ANIMATION_INTENSITY) -> ImageClip:
@@ -1388,7 +1513,7 @@ class VideoBuilder:
             frame = gf(t)
             progress = np.clip(t / clip.duration, 0.0, 1.0) if clip.duration else 0.0
             delta = intensity * (progress if zoom_in else (1.0 - progress))
-            factor = 1.0 + delta
+            factor = self._clamp_scale(1.0 + delta)
             from PIL import Image
 
             pil_img = Image.fromarray(frame)
@@ -1403,7 +1528,7 @@ class VideoBuilder:
 
     def _apply_pan(self, clip: ImageClip, direction: str = "left") -> ImageClip:
         direction = direction.lower()
-        zoom_boost = 1.0 + (ANIMATION_INTENSITY * 0.6)
+        zoom_boost = self._clamp_scale(1.0 + (ANIMATION_INTENSITY * 0.6))
 
         def pan_effect(gf, t):
             frame = gf(t)
@@ -1438,7 +1563,7 @@ class VideoBuilder:
             progress = np.clip(t / clip.duration if clip.duration else 0.0, 0.0, 1.0)
             # smoothstep para movimento suave
             progress = progress * progress * (3 - 2 * progress)
-            scale = 1.0 + ANIMATION_INTENSITY * (0.8 + progress)
+            scale = self._clamp_scale(1.0 + ANIMATION_INTENSITY * (0.8 + progress))
             from PIL import Image
 
             pil_img = Image.fromarray(frame)
@@ -1487,7 +1612,7 @@ class VideoBuilder:
         def effect(gf, t):
             frame = gf(t)
             phase = 2 * np.pi * (t / max(clip.duration or 0.001, 0.001))
-            scale = 1.0 + wobble * np.sin(phase) * direction
+            scale = self._clamp_scale(1.0 + wobble * np.sin(phase) * direction)
             angle = 3.0 * wobble * 50 * np.sin(phase * 0.5) * direction
             from PIL import Image
 
@@ -1505,7 +1630,7 @@ class VideoBuilder:
         def effect(gf, t):
             frame = gf(t)
             progress = np.sin(2 * np.pi * (t / max(clip.duration or 0.001, 0.001)))
-            factor = 1.0 + ANIMATION_INTENSITY * 0.3 * progress
+            factor = self._clamp_scale(1.0 + ANIMATION_INTENSITY * 0.3 * progress)
             from PIL import Image
 
             pil_img = Image.fromarray(frame)
@@ -1513,6 +1638,100 @@ class VideoBuilder:
             pil_img = pil_img.resize(new_size, Image.LANCZOS)
             x = (pil_img.width - frame.shape[1]) // 2
             y = (pil_img.height - frame.shape[0]) // 2
+            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_dolly(self, clip: ImageClip, direction: str = "left") -> ImageClip:
+        direction = str(direction or "left").lower()
+        sign = -1 if direction == "left" else 1
+
+        def effect(gf, t):
+            frame = gf(t)
+            progress = np.clip(t / max(clip.duration or 0.001, 0.001), 0.0, 1.0)
+            from PIL import Image
+
+            base = 1.0 + ANIMATION_INTENSITY * 0.85
+            peak = 1.0 + ANIMATION_INTENSITY * 1.6
+            factor = self._clamp_scale(base + (peak - base) * progress)
+            pil_img = Image.fromarray(frame)
+            new_w = max(frame.shape[1], int(pil_img.width * factor))
+            new_h = max(frame.shape[0], int(pil_img.height * factor))
+            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+            max_x = max(0, new_w - frame.shape[1])
+            max_y = max(0, new_h - frame.shape[0])
+            center_x = max_x * 0.5
+            travel = max_x * 0.32 * progress
+            x = int(np.clip(center_x + sign * travel, 0, max_x))
+            y = int(max_y * (0.45 + 0.1 * progress))
+            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_orbit(self, clip: ImageClip) -> ImageClip:
+        def effect(gf, t):
+            frame = gf(t)
+            progress = np.clip(t / max(clip.duration or 0.001, 0.001), 0.0, 1.0)
+            phase = progress * 2.0 * np.pi
+            from PIL import Image
+
+            factor = self._clamp_scale(1.0 + ANIMATION_INTENSITY * 1.05)
+            pil_img = Image.fromarray(frame)
+            new_w = max(frame.shape[1], int(pil_img.width * factor))
+            new_h = max(frame.shape[0], int(pil_img.height * factor))
+            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+            max_x = max(0, new_w - frame.shape[1])
+            max_y = max(0, new_h - frame.shape[0])
+            radius_x = max_x * 0.38
+            radius_y = max_y * 0.38
+            cx = max_x * 0.5
+            cy = max_y * 0.5
+            x = int(np.clip(cx + np.cos(phase) * radius_x * 0.5, 0, max_x))
+            y = int(np.clip(cy + np.sin(phase) * radius_y * 0.5, 0, max_y))
+            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_handheld(self, clip: ImageClip) -> ImageClip:
+        def effect(gf, t):
+            frame = gf(t)
+            from PIL import Image
+
+            d = max(clip.duration or 0.001, 0.001)
+            phase = 2.0 * np.pi * (t / d)
+            jitter_x = (np.sin(phase * 2.4) + 0.55 * np.sin(phase * 5.3 + 1.3)) * ANIMATION_INTENSITY * 0.014
+            jitter_y = (np.cos(phase * 1.9 + 0.7) + 0.45 * np.sin(phase * 4.6 + 0.2)) * ANIMATION_INTENSITY * 0.014
+            angle = (np.sin(phase * 1.6) + 0.3 * np.sin(phase * 3.7)) * ANIMATION_INTENSITY * 2.8
+
+            pil_img = Image.fromarray(frame)
+            pil_img = pil_img.rotate(angle, resample=Image.BICUBIC, expand=True)
+            x = int((pil_img.width - frame.shape[1]) // 2 + jitter_x * frame.shape[1])
+            y = int((pil_img.height - frame.shape[0]) // 2 + jitter_y * frame.shape[0])
+            x = max(0, min(x, pil_img.width - frame.shape[1]))
+            y = max(0, min(y, pil_img.height - frame.shape[0]))
+            return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
+
+        return clip.transform(effect, keep_duration=True)
+
+    def _apply_drift_diag(self, clip: ImageClip) -> ImageClip:
+        def effect(gf, t):
+            frame = gf(t)
+            progress = np.clip(t / max(clip.duration or 0.001, 0.001), 0.0, 1.0)
+            eased = progress * progress * (3 - 2 * progress)
+            from PIL import Image
+
+            factor = self._clamp_scale(1.0 + ANIMATION_INTENSITY * 0.95)
+            pil_img = Image.fromarray(frame)
+            new_w = max(frame.shape[1], int(pil_img.width * factor))
+            new_h = max(frame.shape[0], int(pil_img.height * factor))
+            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+            max_x = max(0, new_w - frame.shape[1])
+            max_y = max(0, new_h - frame.shape[0])
+            x = int(np.clip(max_x * (0.08 + 0.82 * eased), 0, max_x))
+            y = int(np.clip(max_y * (0.1 + 0.75 * eased), 0, max_y))
             return np.array(pil_img.crop((x, y, x + frame.shape[1], y + frame.shape[0])))
 
         return clip.transform(effect, keep_duration=True)
@@ -1555,27 +1774,89 @@ def run_ffmpeg_filtergraph(input_path: Path, filtergraph: str) -> Path | None:
         return None
 
 
-def _make_placeholder_image(text: str, format_ratio: str) -> Path:
+def _make_placeholder_image(text: str, format_ratio: str, variant: str = "a") -> Path:
     from PIL import Image, ImageDraw, ImageFont
 
     size = VIDEO_FORMATS.get(format_ratio, VIDEO_FORMATS["16:9"])
     width, height = int(size["width"]), int(size["height"])
-    img = Image.new("RGB", (width, height), color=(12, 16, 24))
+    variant_key = str(variant or "a").strip().lower()
+    palettes = {
+        "a": {
+            "top": (14, 24, 56),
+            "bottom": (34, 134, 214),
+            "accent": (255, 214, 95),
+            "shape": (58, 244, 192),
+            "text": (236, 246, 255),
+            "subtext": (165, 220, 255),
+        },
+        "b": {
+            "top": (52, 16, 28),
+            "bottom": (210, 76, 42),
+            "accent": (255, 236, 152),
+            "shape": (255, 122, 60),
+            "text": (255, 244, 236),
+            "subtext": (255, 214, 184),
+        },
+    }
+    palette = palettes.get(variant_key, palettes["a"])
+    img = Image.new("RGB", (width, height), color=palette["top"])
     draw = ImageDraw.Draw(img)
     title = text[:120] or "PrÃ©via"
     subtitle = "MoviePy Preview"
     try:
         font_big = ImageFont.truetype("arialbd.ttf", 72)
         font_small = ImageFont.truetype("arialbd.ttf", 38)
+        font_stamp = ImageFont.truetype("arialbd.ttf", 190)
     except Exception:
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
+        font_stamp = ImageFont.load_default()
+
+    # Fundo em gradiente para dar textura e facilitar visualizacao das transicoes.
+    top_r, top_g, top_b = palette["top"]
+    bot_r, bot_g, bot_b = palette["bottom"]
+    for y in range(height):
+        pct = y / max(1, height - 1)
+        line = (
+            int(top_r + (bot_r - top_r) * pct),
+            int(top_g + (bot_g - top_g) * pct),
+            int(top_b + (bot_b - top_b) * pct),
+        )
+        draw.line((0, y, width, y), fill=line)
+
+    if variant_key == "b":
+        draw.ellipse(
+            (int(width * 0.06), int(height * 0.08), int(width * 0.45), int(height * 0.68)),
+            outline=palette["accent"],
+            width=max(3, int(height * 0.01)),
+        )
+        draw.rectangle(
+            (int(width * 0.62), int(height * 0.18), int(width * 0.92), int(height * 0.38)),
+            fill=palette["shape"],
+        )
+    else:
+        draw.rectangle(
+            (int(width * 0.08), int(height * 0.12), int(width * 0.38), int(height * 0.34)),
+            fill=palette["shape"],
+        )
+        draw.polygon(
+            [
+                (int(width * 0.72), int(height * 0.15)),
+                (int(width * 0.92), int(height * 0.42)),
+                (int(width * 0.66), int(height * 0.5)),
+            ],
+            fill=palette["accent"],
+        )
+
+    stamp = "B" if variant_key == "b" else "A"
+    draw.text((int(width * 0.04), int(height * 0.66)), stamp, font=font_stamp, fill=(255, 255, 255))
+
     title_box = draw.textbbox((0, 0), title, font=font_big)
     subtitle_box = draw.textbbox((0, 0), subtitle, font=font_small)
     tw, th = title_box[2] - title_box[0], title_box[3] - title_box[1]
     sw, sh = subtitle_box[2] - subtitle_box[0], subtitle_box[3] - subtitle_box[1]
-    draw.text(((width - tw) / 2, height * 0.38), title, font=font_big, fill=(235, 242, 255))
-    draw.text(((width - sw) / 2, height * 0.55), subtitle, font=font_small, fill=(144, 199, 255))
+    draw.text(((width - tw) / 2, height * 0.4), title, font=font_big, fill=palette["text"])
+    draw.text(((width - sw) / 2, height * 0.58), subtitle, font=font_small, fill=palette["subtext"])
     target = config.ASSETS_DIR / "cache" / f"preview_{uuid.uuid4().hex}.png"
     target.parent.mkdir(parents=True, exist_ok=True)
     img.save(target, format="PNG")
@@ -1612,19 +1893,23 @@ def build_effects_preview(
     caption_text: str = "PrÃ©via de efeitos",
     duration: float = 3.5,
     ffmpeg_filters: Optional[str] = None,
+    image_scale: Optional[float] = None,
 ) -> Path:
     """
     Renderiza um MP4 curto para testar combinaÃ§Ã£o de transiÃ§Ã£o + filtro + animaÃ§Ã£o.
     Gera 2 cenas com imagens placeholder e Ã¡udio silencioso.
     """
     dur = max(1.5, min(8.0, float(duration)))
+    transition_name = (transition or "crossfade").lower()
+    preview_transition_duration = min(1.0, max(0.35, dur * 0.22))
     builder = VideoBuilder(
         format_ratio=format_ratio,
-        transition_style=transition or "mixed",
-        transition_types=[transition] if transition else None,
-        transition_duration=min(1.2, max(0.2, TRANSITION_DURATION)),
+        transition_style=transition_name,
+        transition_types=[transition_name],
+        transition_duration=preview_transition_duration,
         color_filter=color_filter,
         color_strength=color_strength if color_strength is not None else 0.35,
+        image_scale=image_scale if image_scale is not None else 1.0,
         narration_volume=1.0,
         music_volume=0.0,
         caption_font_scale=config.CAPTION_FONT_SCALE,
@@ -1634,8 +1919,8 @@ def build_effects_preview(
         caption_y_pct=config.CAPTION_Y_PCT,
     )
 
-    img1 = _make_placeholder_image(f"{caption_text} â€¢ Cena A", format_ratio)
-    img2 = _make_placeholder_image(f"{caption_text} â€¢ Cena B", format_ratio)
+    img1 = _make_placeholder_image(f"{caption_text} | Cena A", format_ratio, variant="a")
+    img2 = _make_placeholder_image(f"{caption_text} | Cena B", format_ratio, variant="b")
     aud1 = _make_silent_audio(dur)
     aud2 = _make_silent_audio(dur)
 
@@ -1648,7 +1933,8 @@ def build_effects_preview(
         music_volume=0.0,
         scene_effects=[animation_type or "kenburns", animation_type or "kenburns"],
         scene_word_timings=[[], []],
-        scene_transitions=[transition or "crossfade", transition or "crossfade"],
+        # Transicao aplicada na entrada da cena B para ficar clara na pre-visualizacao.
+        scene_transitions=["none", transition_name],
         scene_filters=[color_filter or "cinematic", color_filter or "cinematic"],
     )
     if ffmpeg_filters:

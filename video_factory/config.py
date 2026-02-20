@@ -55,6 +55,8 @@ EDGE_VOICE = env("EDGE_VOICE", "pt-BR-ThalitaMultilingualNeural")
 ELEVEN_API_KEY = env("ELEVEN_API_KEY")
 SPEECHIFY_API_KEY = env("SPEECHIFY_API_KEY")
 TTS_PROVIDER = env("TTS_PROVIDER", "edge,offline")  # ordem de tentativa: ex. "edge,offline"
+TTS_CACHE_ENABLED = env("TTS_CACHE_ENABLED", "1").lower() in {"1", "true", "yes"}
+SCENE_PREP_CONCURRENCY = max(1, int(env("SCENE_PREP_CONCURRENCY", "2")))
 
 # Vídeo / render
 FPS = int(env("VIDEO_FPS", "30"))
@@ -72,6 +74,11 @@ VIDEO_CODEC = CODEC
 VIDEO_AUDIO_CODEC = AUDIO_CODEC
 VIDEO_PRESET = env("VIDEO_PRESET", "veryfast")
 VIDEO_THREADS = int(env("VIDEO_THREADS", str(max(4, multiprocessing.cpu_count() or 4))))
+GPU_ENCODER_PREFERENCE = [
+    item.strip().lower()
+    for item in env("GPU_ENCODER_PREFERENCE", "h264_nvenc,hevc_nvenc,h264_qsv,hevc_qsv,h264_amf,hevc_amf").split(",")
+    if item.strip()
+]
 
 # Legendas / mixagem
 CAPTION_FONT_SCALE = float(env("CAPTION_FONT_SCALE", "1.0"))  # multiplicador sobre tamanho base
@@ -86,17 +93,18 @@ KARAOKE_MIN_HOLD = float(env("KARAOKE_MIN_HOLD", "0.08"))
 
 ANIMATION_INTENSITY = float(env("ANIMATION_INTENSITY", "0.35"))
 FADE_DURATION = float(env("FADE_DURATION", "0.6"))
+MAX_UPSCALE = float(env("MAX_UPSCALE", "1.35"))
 ANIMATION_TYPES = [
     item.strip()
     for item in env(
         "ANIMATION_TYPES",
-        "kenburns,zoom_in,zoom_out,zoom_in_fast,zoom_out_fast,pan_left,pan_right,pan_up,pan_down,rotate_left,rotate_right,sway,pulse,warp_in,warp_out",
+        "kenburns,zoom_in,zoom_out,zoom_in_fast,zoom_out_fast,pan_left,pan_right,pan_up,pan_down,rotate_left,rotate_right,sway,pulse,warp_in,warp_out,dolly_left,dolly_right,orbit,handheld,drift_diag",
     ).split(",")
     if item.strip()
 ]
 ANIMATION_STYLE = env("ANIMATION_STYLE", "mixed")
 TRANSITION_STYLE = env("TRANSITION_STYLE", "mixed")
-TRANSITION_TYPES = [item.strip() for item in env("TRANSITION_TYPES", "fade,crossfade,slide_left,slide_right,slide_up,slide_down").split(",") if item.strip()]
+TRANSITION_TYPES = [item.strip() for item in env("TRANSITION_TYPES", "fade,crossfade,slide_left,slide_right,slide_up,slide_down,zoom_in,zoom_out,whip_left,whip_right,flash_white,dip_black").split(",") if item.strip()]
 TRANSITION_DURATION = float(env("TRANSITION_DURATION", "0.6"))
 
 # Cache

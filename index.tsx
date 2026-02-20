@@ -208,9 +208,16 @@ const App: React.FC = () => {
     { id: 'slide_right', label: 'Slide Right' },
     { id: 'slide_up', label: 'Slide Up' },
     { id: 'slide_down', label: 'Slide Down' },
+    { id: 'zoom_in', label: 'Zoom Transition In' },
+    { id: 'zoom_out', label: 'Zoom Transition Out' },
+    { id: 'whip_left', label: 'Whip Left' },
+    { id: 'whip_right', label: 'Whip Right' },
+    { id: 'flash_white', label: 'Flash White' },
+    { id: 'dip_black', label: 'Dip To Black' },
     { id: 'none', label: 'Sem transicao' },
   ];
   const animationOptions = [
+    { id: 'none', label: 'Sem animação' },
     { id: 'kenburns', label: 'Ken Burns' },
     { id: 'zoom_in', label: 'Zoom In' },
     { id: 'zoom_out', label: 'Zoom Out' },
@@ -226,6 +233,11 @@ const App: React.FC = () => {
     { id: 'pulse', label: 'Pulse' },
     { id: 'warp_in', label: 'Warp In' },
     { id: 'warp_out', label: 'Warp Out' },
+    { id: 'dolly_left', label: 'Dolly Left' },
+    { id: 'dolly_right', label: 'Dolly Right' },
+    { id: 'orbit', label: 'Orbit' },
+    { id: 'handheld', label: 'Handheld' },
+    { id: 'drift_diag', label: 'Drift Diagonal' },
   ];
   const filterOptions = [
     { id: 'none', label: 'Nenhum' },
@@ -252,7 +264,13 @@ const App: React.FC = () => {
   const [renderRealInfo, setRenderRealInfo] = useState<string>('');
   const [renderStaleSeconds, setRenderStaleSeconds] = useState<number>(0);
   const [renderElapsedSeconds, setRenderElapsedSeconds] = useState<number>(0);
+  const [renderFileExists, setRenderFileExists] = useState<boolean>(false);
+  const [renderFileSizeMb, setRenderFileSizeMb] = useState<number>(0);
+  const [renderFileGrowthKbps, setRenderFileGrowthKbps] = useState<number>(0);
+  const [renderFileDeltaKb, setRenderFileDeltaKb] = useState<number>(0);
+  const [renderFileEtaSeconds, setRenderFileEtaSeconds] = useState<number>(0);
   const renderStartedAtRef = useRef<number | null>(null);
+  const lastFullRenderBaseFingerprintRef = useRef<string | null>(null);
   const [format, setFormat] = useState<'16:9' | '9:16'>('16:9');
   const [importError, setImportError] = useState<string | null>(null);
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
@@ -285,7 +303,10 @@ const App: React.FC = () => {
   const [previewColorStrength, setPreviewColorStrength] = useState<number>(0.5);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isPreviewRendering, setIsPreviewRendering] = useState<boolean>(false);
+  const [isPreviewBatchRendering, setIsPreviewBatchRendering] = useState<boolean>(false);
+  const [previewTransitionSamples, setPreviewTransitionSamples] = useState<{ transition: string; label: string; url: string }[]>([]);
   const [previewFilters, setPreviewFilters] = useState<string>('');
+  const [previewImageScale, setPreviewImageScale] = useState<number>(1);
   const backendWarnRef = useRef<number>(0);
   const [ffmpegFilters, setFfmpegFilters] = useState<string>('');
   const [stabilize, setStabilize] = useState<boolean>(false);
@@ -1084,36 +1105,41 @@ const App: React.FC = () => {
     }
   };
 
+  const requestEffectsPreviewUrl = async (transitionValue: string, captionLabel?: string) => {
+    const payload = {
+      format,
+      transition: transitionValue,
+      filter: previewFilter,
+      colorStrength: previewColorStrength,
+      animationType: previewAnimation,
+      captionText: captionLabel || previewText || 'Prévia de efeitos',
+      duration: 3.5,
+      ffmpegFilters: previewFilters || undefined,
+      stabilize,
+      aiEnhance,
+      engine,
+      imageScale: previewImageScale || imageScale || 1,
+    };
+    const res = await apiFetch('/api/render/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    return (data.web_url && apiBase ? `${apiBase}${data.web_url}` : data.output) || null;
+  };
+
   const previewVideoEffects = async () => {
-    if (isPreviewRendering) return;
+    if (isPreviewRendering || isPreviewBatchRendering) return;
     if (!ensureApiOrWarn()) return;
     setIsPreviewRendering(true);
     setStatusMessage('Gerando prévia curta de efeitos...');
     try {
-      const payload = {
-        format,
-        transition: previewTransition,
-        filter: previewFilter,
-        colorStrength: previewColorStrength,
-        animationType: previewAnimation,
-        captionText: previewText || 'Prévia de efeitos',
-        duration: 3.5,
-        ffmpegFilters: previewFilters || undefined,
-        stabilize,
-        aiEnhance,
-        engine,
-      };
-      const res = await apiFetch('/api/render/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.detail || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      const url = data.web_url && apiBase ? `${apiBase}${data.web_url}` : data.output;
+      const url = await requestEffectsPreviewUrl(previewTransition);
       setPreviewUrl(url || null);
       pushLog('Prévia de efeitos gerada (3-4s)', 'info');
     } catch (err: any) {
@@ -1122,6 +1148,48 @@ const App: React.FC = () => {
       setStatusMessage(`Prévia falhou: ${msg}`);
     } finally {
       setIsPreviewRendering(false);
+    }
+  };
+
+  const previewAllTransitions = async () => {
+    if (isPreviewRendering || isPreviewBatchRendering) return;
+    if (!ensureApiOrWarn()) return;
+    const transitions = transitionOptions.map(opt => ({ id: opt.id, label: opt.label }));
+    setIsPreviewBatchRendering(true);
+    setPreviewTransitionSamples([]);
+    setStatusMessage(`Gerando amostras de transição (0/${transitions.length})...`);
+    const samples: { transition: string; label: string; url: string }[] = [];
+    try {
+      for (let i = 0; i < transitions.length; i++) {
+        const item = transitions[i];
+        setStatusMessage(`Gerando amostras de transição (${i + 1}/${transitions.length}): ${item.label}`);
+        try {
+          const url = await requestEffectsPreviewUrl(item.id, `${previewText || 'Prévia de efeitos'} | ${item.label}`);
+          if (url) {
+            samples.push({ transition: item.id, label: item.label, url });
+          }
+        } catch (innerErr: any) {
+          const innerMsg = innerErr?.message || String(innerErr);
+          pushLog(`Falha na amostra ${item.label}: ${innerMsg}`, 'error');
+        }
+      }
+
+      if (!samples.length) {
+        throw new Error('Nenhuma amostra foi gerada.');
+      }
+      setPreviewTransitionSamples(samples);
+      const selectedSample = samples.find(s => s.transition === previewTransition);
+      if (selectedSample) {
+        setPreviewUrl(selectedSample.url);
+      }
+      pushLog(`Amostras de transição geradas: ${samples.length}/${transitions.length}`, 'info');
+      setStatusMessage(`Amostras prontas (${samples.length}/${transitions.length}).`);
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      pushLog(`Falha ao gerar amostras de transição: ${msg}`, 'error');
+      setStatusMessage(`Amostras falharam: ${msg}`);
+    } finally {
+      setIsPreviewBatchRendering(false);
     }
   };
 
@@ -1698,14 +1766,30 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
     setRenderRealInfo('');
     setRenderStaleSeconds(0);
     setRenderElapsedSeconds(0);
+    setRenderFileExists(false);
+    setRenderFileSizeMb(0);
+    setRenderFileGrowthKbps(0);
+    setRenderFileDeltaKb(0);
+    setRenderFileEtaSeconds(0);
     renderStartedAtRef.current = Date.now();
-    setStatusMessage('Iniciando render com motor local...');
+    const baseFingerprint = buildBaseRenderFingerprint();
+    const canUsePostOnly =
+      timelineEditMode === 'post'
+      && Boolean(videoUrl)
+      && Boolean(lastFullRenderBaseFingerprintRef.current)
+      && lastFullRenderBaseFingerprintRef.current === baseFingerprint;
+    const postOnlyRender = canUsePostOnly;
+    setStatusMessage(postOnlyRender ? 'Iniciando pós-processamento incremental...' : 'Iniciando render com motor local...');
 
     let producedUrl: string | null = null;
     try {
       const hasLocalAssets = script.scenes.some(s => s.localImage || s.localSfx) || settings.localThemeRef || settings.localBackgroundMusic;
 
-      if (!hasLocalAssets) {
+      if (timelineEditMode === 'post' && videoUrl && !postOnlyRender) {
+        pushLog('Mudanças estruturais detectadas no projeto. Executando render completo.', 'warn');
+      }
+
+      if (!postOnlyRender && !hasLocalAssets) {
         setStatusMessage('Adicione imagens ou áudio local antes de processar. O motor local precisa de assets locais para criar o vídeo.');
         pushLog('Render abortado: faltam assets locais.', 'warn');
         setCurrentStep('assets');
@@ -1750,6 +1834,8 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
         stabilize,
         aiEnhance,
         engine,
+        postOnly: postOnlyRender,
+        baseVideoUrl: postOnlyRender ? videoUrl : undefined,
       };
 
       const startRes = await apiFetch('/api/render/start', {
@@ -1764,7 +1850,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       }
       const { task_id } = await startRes.json();
       setRenderTaskId(task_id);
-      setStatusMessage('Render em andamento...');
+      setStatusMessage(postOnlyRender ? 'Pós-processamento em andamento...' : 'Render em andamento...');
       pushLog(`Render iniciado (task ${task_id.slice(0, 6)}...)`, 'info');
 
       let done = false;
@@ -1776,6 +1862,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
         const staleSeconds = Number(st.stale_seconds || 0);
         const stageProgressPct = Math.max(0, Math.min(100, Number(st.stage_progress || 0) * 100));
         const detail = (st.render_detail || null) as any;
+        const fileStats = (st.file_stats || null) as any;
         const backendPct = Math.max(0, Math.min(100, Number(st.progress || 0) * 100));
         const syntheticPct = stageLabel === 'finalizando'
           ? Math.min(99.9, Math.max(backendPct, 98.5 + Math.min(staleSeconds, 120) * 0.012))
@@ -1789,6 +1876,13 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
         setRenderStaleSeconds(staleSeconds);
         setRenderProgress(syntheticPct);
         setRenderRealPct(stageProgressPct);
+        const fileExists = Boolean(fileStats?.exists);
+        setRenderFileExists(fileExists);
+        setRenderFileSizeMb(fileExists ? Math.max(0, Number(fileStats?.size_mb || 0)) : 0);
+        setRenderFileGrowthKbps(fileExists ? Math.max(0, Number(fileStats?.growth_ema_kbps ?? fileStats?.growth_kbps ?? 0)) : 0);
+        setRenderFileDeltaKb(fileExists ? Math.max(0, Number(fileStats?.delta_kb || 0)) : 0);
+        setRenderFileEtaSeconds(fileExists ? Math.max(0, Number(fileStats?.eta_seconds || 0)) : 0);
+        const isPostOnly = Boolean(detail?.post_only);
         if (String(stageLabel).toLowerCase() === 'render') {
           const current = Number(detail?.current || 0);
           const total = Number(detail?.total || 0);
@@ -1801,7 +1895,7 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
         } else if (String(stageLabel).toLowerCase() === 'tts') {
           setRenderRealInfo(`Narrações ${stageProgressPct.toFixed(1)}%`);
         } else if (String(stageLabel).toLowerCase() === 'post' || String(stageLabel).toLowerCase() === 'finalizando') {
-          setRenderRealInfo(`Finalização ${stageProgressPct.toFixed(1)}%`);
+          setRenderRealInfo(isPostOnly ? `Pós incremental ${stageProgressPct.toFixed(1)}%` : `Finalização ${stageProgressPct.toFixed(1)}%`);
         } else {
           setRenderRealInfo('');
         }
@@ -1825,6 +1919,9 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
           setRenderRealInfo('Montagem concluída');
           setStatusMessage('Render concluído');
           pushLog(`Render concluído: ${finalUrl || rawUrl || st.output}`, 'info');
+          if (!postOnlyRender && baseFingerprint) {
+            lastFullRenderBaseFingerprintRef.current = baseFingerprint;
+          }
           setTimelineEditMode('post');
           setWorkspacePage('studio');
           setCurrentStep('done');
@@ -1843,6 +1940,11 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       if (!producedUrl) {
         setRenderRealPct(0);
         setRenderRealInfo('');
+        setRenderFileExists(false);
+        setRenderFileSizeMb(0);
+        setRenderFileGrowthKbps(0);
+        setRenderFileDeltaKb(0);
+        setRenderFileEtaSeconds(0);
       }
       setRenderStaleSeconds(0);
       renderStartedAtRef.current = null;
@@ -1952,6 +2054,47 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
       return apiBase ? `${apiBase}${webPath}` : webPath;
     }
     return raw;
+  };
+
+  const buildBaseRenderFingerprint = () => {
+    if (!script) return '';
+    const backgroundMusicValue = settings.localBackgroundMusic
+      || (settings.backgroundMusic && settings.backgroundMusic.startsWith('data:') ? settings.backgroundMusic : '');
+    const basePayload = {
+      scenes: script.scenes.map(s => ({
+        id: String(s.id),
+        text: s.text,
+        visualPrompt: s.visualPrompt,
+        localImage: s.localImage,
+        narrationVolume: s.narrationVolume ?? 1,
+        trimStartMs: s.trimStartMs ?? 0,
+        trimEndMs: s.trimEndMs ?? 0,
+        audioOffsetMs: s.audioOffsetMs ?? 0,
+        localSfx: s.localSfx,
+        sfxVolume: s.sfxVolume ?? 0.35,
+        animationType: (s as any).animationType,
+        transition: s.transition || settings.defaultTransition,
+        filter: s.filter || settings.defaultFilter,
+        flowTo: s.flowTo ? String(s.flowTo) : null,
+      })),
+      format,
+      voice: edgeVoiceId,
+      scriptTitle: script.title,
+      backgroundMusic: backgroundMusicValue || null,
+      transitionStyle: settings.defaultTransition || 'mixed',
+      colorFilter: settings.defaultFilter || 'none',
+      musicVolume,
+      narrationVolume,
+      colorStrength,
+      transitionDuration,
+      imageScale,
+      captionFontScale: captionScale,
+      captionBgOpacity: captionBg,
+      captionColor,
+      captionHighlightColor: captionHighlight,
+      captionYPct: captionY / 100,
+    };
+    return JSON.stringify(basePayload);
   };
   const timelineSceneMeta = useMemo(() => {
     if (!script) return [];
@@ -2486,30 +2629,47 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
                         {animationOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
                       </select>
                     </div>
-                    <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Filtro</label>
-                      <select value={previewFilter} onChange={e => setPreviewFilter(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
-                        {filterOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Força do filtro ({previewColorStrength.toFixed(2)})</label>
-                      <input type="range" min={0} max={1.5} step={0.05} value={previewColorStrength} onChange={e => setPreviewColorStrength(parseFloat(e.target.value))} className="accent-cyan-400" />
-                    </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-gray-500 uppercase font-bold">Filtro</label>
+                    <select value={previewFilter} onChange={e => setPreviewFilter(e.target.value)} className="bg-black/40 text-xs p-2.5 rounded-xl border border-gray-800 text-gray-200 outline-none focus:border-cyan-400/70 transition-all">
+                      {filterOptions.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+                    </select>
                   </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-gray-500 uppercase font-bold">Força do filtro ({previewColorStrength.toFixed(2)})</label>
+                    <input type="range" min={0} max={1.5} step={0.05} value={previewColorStrength} onChange={e => setPreviewColorStrength(parseFloat(e.target.value))} className="accent-cyan-400" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-gray-500 uppercase font-bold">Zoom da imagem ({previewImageScale.toFixed(2)}x)</label>
+                    <input type="range" min={0.85} max={1.35} step={0.02} value={previewImageScale} onChange={e => setPreviewImageScale(parseFloat(e.target.value))} className="accent-cyan-400" />
+                  </div>
+                </div>
                   <div className="mt-2 flex flex-col gap-1">
                     <label className="text-[10px] text-gray-500 uppercase font-bold">FFmpeg filtergraph (opcional)</label>
                     <textarea value={previewFilters} onChange={e => setPreviewFilters(e.target.value)} rows={2} className="w-full bg-black/40 border border-gray-800 rounded-xl px-3 py-2 text-[11px] text-gray-100 outline-none focus:border-cyan-400/70" placeholder="ex: unsharp=luma_msize_x=5:luma_amount=1.2,eq=saturation=1.2" />
                   </div>
-                  <div className="flex items-center gap-2 mt-3">
-                    <button onClick={previewVideoEffects} disabled={isPreviewRendering} className="px-3 py-2 rounded-xl bg-cyan-600/80 hover:bg-cyan-500 text-white text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
+                  <div className="flex items-center gap-2 mt-3 flex-wrap">
+                    <button onClick={previewVideoEffects} disabled={isPreviewRendering || isPreviewBatchRendering} className="px-3 py-2 rounded-xl bg-cyan-600/80 hover:bg-cyan-500 text-white text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
                       {isPreviewRendering ? 'Gerando...' : 'Gerar prévia'}
+                    </button>
+                    <button onClick={previewAllTransitions} disabled={isPreviewRendering || isPreviewBatchRendering} className="px-3 py-2 rounded-xl border border-cyan-500/40 text-cyan-200 hover:text-white hover:border-cyan-300 text-[10px] font-black uppercase tracking-[0.16em] transition-all disabled:opacity-50">
+                      {isPreviewBatchRendering ? 'Gerando todas...' : 'Gerar amostras (todas)'}
                     </button>
                     <span className="text-[10px] text-gray-400">MP4 de 3-4s para validar transicao + filtro + animacao + FFmpeg.</span>
                   </div>
                   {previewUrl && (
                     <div className="mt-3 rounded-xl overflow-hidden border border-cyan-500/30 bg-black/40 p-2">
                       <video src={previewUrl} className="w-full rounded-lg" controls muted loop playsInline />
+                    </div>
+                  )}
+                  {previewTransitionSamples.length > 0 && (
+                    <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {previewTransitionSamples.map(sample => (
+                        <div key={`transition-sample-${sample.transition}`} className="rounded-xl overflow-hidden border border-cyan-500/20 bg-black/40 p-2">
+                          <div className="text-[10px] font-black uppercase tracking-[0.14em] text-cyan-200 mb-1">{sample.label}</div>
+                          <video src={sample.url} className="w-full rounded-lg" controls muted loop playsInline />
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -3643,6 +3803,25 @@ ${attempt > 1 ? '- IMPORTANTE: a tentativa anterior ficou repetitiva. Aumente ai
                           {renderRealInfo && (
                             <div className="mt-1 text-[10px] font-mono text-emerald-300">{renderRealInfo}</div>
                           )}
+                        </div>
+                      )}
+                      {renderFileExists && (
+                        <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[10px] font-mono">
+                          <div className="rounded-lg bg-white/5 border border-white/10 px-2 py-1">
+                            <div className="text-gray-500 uppercase tracking-widest text-[9px]">Arquivo</div>
+                            <div className="text-cyan-200">{renderFileSizeMb.toFixed(2)} MB</div>
+                          </div>
+                          <div className="rounded-lg bg-white/5 border border-white/10 px-2 py-1">
+                            <div className="text-gray-500 uppercase tracking-widest text-[9px]">Crescimento</div>
+                            <div className="text-emerald-300">{renderFileGrowthKbps.toFixed(1)} KB/s</div>
+                          </div>
+                          <div className="rounded-lg bg-white/5 border border-white/10 px-2 py-1">
+                            <div className="text-gray-500 uppercase tracking-widest text-[9px]">Delta / ETA</div>
+                            <div className="text-violet-200">
+                              +{renderFileDeltaKb.toFixed(1)} KB
+                              {renderFileEtaSeconds > 0 ? ` • ${formatRenderElapsed(renderFileEtaSeconds)}` : ''}
+                            </div>
+                          </div>
                         </div>
                       )}
                       <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-gray-500">

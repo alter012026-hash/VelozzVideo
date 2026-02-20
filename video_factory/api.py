@@ -146,6 +146,7 @@ class PreviewRequest(BaseModel):
     stabilize: bool = False
     aiEnhance: bool = False
     engine: str | None = None
+    imageScale: float | None = None
 
 
 @app.post("/api/render/preview")
@@ -163,6 +164,7 @@ async def render_preview(body: PreviewRequest):
             caption_text=body.captionText or "PrÃ©via de efeitos",
             duration=body.duration or 3.5,
             ffmpeg_filters=body.ffmpegFilters,
+            image_scale=body.imageScale,
         )
         return {"output": str(path), "web_url": _path_to_web(path)}
     except Exception as exc:  # noqa: BLE001
@@ -242,6 +244,81 @@ def _path_to_web(path: Path | str | None) -> str | None:
     return None
 
 
+def _resolve_task_output_path(payload: Dict[str, Any]) -> Path | None:
+    candidate = payload.get("output") or payload.get("output_path")
+    detail = payload.get("render_detail")
+    if not candidate and isinstance(detail, dict):
+        candidate = detail.get("output_path") or detail.get("output")
+    if not candidate:
+        return None
+    try:
+        return Path(str(candidate))
+    except Exception:
+        return None
+
+
+def _attach_file_stats(task_id: str, payload: Dict[str, Any], now_ts: float) -> None:
+    path = _resolve_task_output_path(payload)
+    if not path:
+        return
+
+    stats: Dict[str, Any] = {
+        "output_path": str(path),
+        "web_url": _path_to_web(path),
+        "exists": path.exists(),
+    }
+    state = STATUS.get(task_id) or {}
+
+    if stats["exists"]:
+        try:
+            size_bytes = int(path.stat().st_size)
+        except Exception:
+            size_bytes = 0
+
+        prev_size = state.get("_file_prev_size")
+        prev_ts = state.get("_file_prev_ts")
+        if prev_size is None or prev_ts is None:
+            delta_bytes = 0
+            sample_sec = 0.0
+            growth_bps = 0.0
+        else:
+            sample_sec = max(1e-6, float(now_ts) - float(prev_ts))
+            delta_bytes = max(0, size_bytes - int(prev_size))
+            growth_bps = float(delta_bytes) / sample_sec
+
+        ema_prev = float(state.get("_file_bps_ema") or 0.0)
+        growth_ema_bps = growth_bps if ema_prev <= 0 else ((0.35 * growth_bps) + (0.65 * ema_prev))
+        state["_file_prev_size"] = size_bytes
+        state["_file_prev_ts"] = float(now_ts)
+        state["_file_bps_ema"] = float(growth_ema_bps)
+
+        stats.update(
+            {
+                "size_bytes": size_bytes,
+                "size_mb": round(size_bytes / (1024 * 1024), 2),
+                "delta_bytes": int(delta_bytes),
+                "delta_kb": round(delta_bytes / 1024.0, 1),
+                "sample_sec": round(sample_sec, 2),
+                "growth_bps": round(growth_bps, 1),
+                "growth_kbps": round(growth_bps / 1024.0, 1),
+                "growth_ema_kbps": round(growth_ema_bps / 1024.0, 1),
+            }
+        )
+
+        detail = payload.get("render_detail")
+        if isinstance(detail, dict):
+            try:
+                current = float(detail.get("current") or 0)
+                total = float(detail.get("total") or 0)
+                fps = float(detail.get("fps") or 0)
+                if total > current and fps > 0:
+                    stats["eta_seconds"] = round((total - current) / fps, 1)
+            except Exception:
+                pass
+
+    payload["file_stats"] = stats
+
+
 async def _run_render_task(task_id: str, request: RenderRequest) -> None:
     try:
         _set_status(
@@ -263,7 +340,11 @@ async def _run_render_task(task_id: str, request: RenderRequest) -> None:
                 message=msg,
             )
             if detail:
-                payload["render_detail"] = detail
+                merged_detail = dict(STATUS.get(task_id, {}).get("render_detail") or {})
+                merged_detail.update(detail)
+                payload["render_detail"] = merged_detail
+                if merged_detail.get("output_path"):
+                    payload["output_path"] = str(merged_detail.get("output_path"))
             _set_status(task_id, **payload)
 
         path = await render_script(request, progress_cb=_progress)
@@ -306,9 +387,10 @@ async def render_status(task_id: str):
     if not data:
         raise HTTPException(status_code=404, detail="Task not found")
     payload = dict(data)
+    now = asyncio.get_running_loop().time()
+    _attach_file_stats(task_id, payload, now)
 
     if not payload.get("done"):
-        now = asyncio.get_running_loop().time()
         updated_at = payload.get("updated_at")
         try:
             stale_seconds = max(0.0, now - float(updated_at))

@@ -8,9 +8,12 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import List, Optional, Callable
 import re
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
@@ -74,6 +77,8 @@ class RenderRequest(BaseModel):
     stabilize: bool = False  # tentativa de estabilização (se libs disponíveis)
     aiEnhance: bool = False  # placeholder p/ futura upscale/denoise
     engine: Optional[str] = None  # moviepy | movielite (quando disponível)
+    postOnly: bool = False
+    baseVideoUrl: Optional[str] = None
 
 
 @dataclass
@@ -123,6 +128,15 @@ def _write_asset(prefix: str, data: bytes, extension: str) -> Path:
     path = folder / f"{prefix}_{uuid.uuid4().hex}.{extension}"
     path.write_bytes(data)
     return path
+
+
+def _tts_cache_paths(text: str, voice: str, ext: str | None) -> tuple[Path, Path]:
+    tts_dir = config.CACHE_DIR / "tts"
+    tts_dir.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha1(f"{voice}\n{text}".encode("utf-8"), usedforsecurity=False).hexdigest()
+    audio_path = tts_dir / f"{h}.{ext or 'mp3'}"
+    meta_path = tts_dir / f"{h}.json"
+    return audio_path, meta_path
 
 
 def _ensure_visual_path(scene: RenderScene, idx: int) -> Path:
@@ -224,6 +238,36 @@ def _sanitize_title(value: str) -> str:
     return safe[:80]
 
 
+def _resolve_base_video_path(value: Optional[str]) -> Optional[Path]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    path_value = raw
+    if raw.startswith("http://") or raw.startswith("https://"):
+        parsed = urlparse(raw)
+        path_value = parsed.path or ""
+
+    normalized = path_value.replace("\\", "/")
+    lower = normalized.lower()
+    if lower.startswith("/assets/"):
+        candidate = config.ASSETS_DIR / normalized[len("/assets/") :]
+    elif "/assets/" in lower:
+        candidate = config.ASSETS_DIR / normalized.split("/assets/", 1)[-1]
+    elif "assets/" in lower:
+        candidate = config.ASSETS_DIR / normalized.split("assets/", 1)[-1]
+    else:
+        candidate = Path(path_value)
+
+    try:
+        candidate = candidate.resolve(strict=False)
+    except Exception:
+        pass
+    return candidate if candidate.exists() else None
+
+
 async def render_script(
     request: RenderRequest,
     progress_cb: Optional[Callable[[str, float, str, Optional[dict]], None]] = None,
@@ -242,37 +286,108 @@ async def render_script(
             except Exception:
                 pass
 
+    if bool(request.postOnly):
+        base_video = _resolve_base_video_path(request.baseVideoUrl)
+        if not base_video:
+            raise RuntimeError("Modo POS exige um video base valido.")
+
+        output = config.ASSETS_DIR / "video" / f"{_sanitize_title(request.scriptTitle or base_video.stem)}_post_{uuid.uuid4().hex}.mp4"
+        _progress(
+            "post",
+            0.0,
+            "Reaproveitando video base (sem remontar cenas).",
+            {"post_only": True, "base_video": str(base_video), "output_path": str(output)},
+        )
+
+        def _build_post_only() -> Path:
+            current = base_video
+            if request.ffmpegFilters:
+                filtered = run_ffmpeg_filtergraph(base_video, request.ffmpegFilters)
+                if filtered and filtered.exists():
+                    current = filtered
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if current.resolve(strict=False) != output.resolve(strict=False):
+                shutil.copy2(current, output)
+            return output
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _build_post_only)
+        _progress("post", 1.0, "Pos-processamento concluido", {"post_only": True, "output_path": str(result)})
+        logger.info("[POST] Render incremental concluido: %s", result)
+        return result
+
     logger.info("[1/5] Gerando narracoes (%d cenas) - voz=%s", len(request.scenes), voice)
     _progress("tts", 0.0, "Gerando narrações")
-    for idx, scene in enumerate(request.scenes):
-        logger.info("  - Cena %d: texto='%s'", idx + 1, scene.text[:80].strip())
-        image_path = _ensure_visual_path(scene, idx)
-        audio_bytes, metadata, audio_ext = await synthesize_to_bytes_with_metadata(scene.text, voice)
-        audio_path = _write_asset("audio", audio_bytes, audio_ext or "mp3")
-        try:
-            scene_narration_volume = max(0.0, min(2.0, float(scene.narrationVolume if scene.narrationVolume is not None else 1.0)))
-        except Exception:
-            scene_narration_volume = 1.0
-        try:
-            trim_start_ms = max(0, min(5000, int(scene.trimStartMs if scene.trimStartMs is not None else 0)))
-        except Exception:
-            trim_start_ms = 0
-        try:
-            trim_end_ms = max(0, min(5000, int(scene.trimEndMs if scene.trimEndMs is not None else 0)))
-        except Exception:
-            trim_end_ms = 0
-        try:
-            audio_offset_ms = max(-3000, min(3000, int(scene.audioOffsetMs if scene.audioOffsetMs is not None else 0)))
-        except Exception:
-            audio_offset_ms = 0
-        sfx_path = _prepare_scene_sfx(scene.localSfx)
-        try:
-            sfx_volume = max(0.0, min(2.0, float(scene.sfxVolume if scene.sfxVolume is not None else 0.35)))
-        except Exception:
-            sfx_volume = 0.35
-        timings = word_timings_from_chunks(metadata)
-        scene_assets.append(
-            SceneAsset(
+
+    sem = asyncio.Semaphore(getattr(config, "SCENE_PREP_CONCURRENCY", 2))
+    scene_assets: list[Optional[SceneAsset]] = [None] * total_scenes
+
+    async def prepare_scene(idx: int, scene: RenderScene) -> None:
+        async with sem:
+            logger.info("  - Cena %d: texto='%s'", idx + 1, scene.text[:80].strip())
+            image_path = _ensure_visual_path(scene, idx)
+
+            # TTS cache
+            use_cache = bool(getattr(config, "TTS_CACHE_ENABLED", True))
+            audio_bytes: bytes
+            metadata: list[dict]
+            audio_ext: str | None
+            cache_audio: Path | None = None
+            cache_meta: Path | None = None
+            if use_cache:
+                cache_audio, cache_meta = _tts_cache_paths(scene.text, voice, "mp3")
+                if cache_audio.exists() and cache_meta.exists():
+                    try:
+                        audio_bytes = cache_audio.read_bytes()
+                        metadata = json.loads(cache_meta.read_text(encoding="utf-8"))
+                        audio_ext = cache_audio.suffix.lstrip(".") or "mp3"
+                    except Exception:
+                        audio_bytes = b""
+                        metadata = []
+                        audio_ext = None
+                else:
+                    audio_bytes = b""
+                    metadata = []
+                    audio_ext = None
+            else:
+                audio_bytes = b""
+                metadata = []
+                audio_ext = None
+
+            if not audio_bytes or not metadata:
+                audio_bytes, metadata, audio_ext = await synthesize_to_bytes_with_metadata(scene.text, voice)
+                if use_cache and cache_audio and cache_meta:
+                    try:
+                        cache_audio.write_bytes(audio_bytes)
+                        cache_meta.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+                    except Exception:
+                        pass
+
+            audio_path = _write_asset("audio", audio_bytes, audio_ext or "mp3")
+
+            try:
+                scene_narration_volume = max(0.0, min(2.0, float(scene.narrationVolume if scene.narrationVolume is not None else 1.0)))
+            except Exception:
+                scene_narration_volume = 1.0
+            try:
+                trim_start_ms = max(0, min(5000, int(scene.trimStartMs if scene.trimStartMs is not None else 0)))
+            except Exception:
+                trim_start_ms = 0
+            try:
+                trim_end_ms = max(0, min(5000, int(scene.trimEndMs if scene.trimEndMs is not None else 0)))
+            except Exception:
+                trim_end_ms = 0
+            try:
+                audio_offset_ms = max(-3000, min(3000, int(scene.audioOffsetMs if scene.audioOffsetMs is not None else 0)))
+            except Exception:
+                audio_offset_ms = 0
+            sfx_path = _prepare_scene_sfx(scene.localSfx)
+            try:
+                sfx_volume = max(0.0, min(2.0, float(scene.sfxVolume if scene.sfxVolume is not None else 0.35)))
+            except Exception:
+                sfx_volume = 0.35
+            timings = word_timings_from_chunks(metadata)
+            scene_assets[idx] = SceneAsset(
                 text=scene.text,
                 image_path=image_path,
                 audio_path=audio_path,
@@ -287,8 +402,10 @@ async def render_script(
                 color_filter=scene.filter,
                 word_timings=timings,
             )
-        )
-        _progress("tts", (idx + 1) / total_scenes, f"Narração cena {idx+1}/{total_scenes}")
+            _progress("tts", (idx + 1) / total_scenes, f"Narração cena {idx+1}/{total_scenes}")
+
+    await asyncio.gather(*(prepare_scene(idx, scene) for idx, scene in enumerate(request.scenes)))
+    scene_assets = [asset for asset in scene_assets if asset is not None]
     logger.info("[1/5] Narracoes concluidas")
 
     logger.info("[2/5] Preparando builder de video (format=%s, transitions=%s)", request.format, request.transitionStyle or "default")
@@ -318,7 +435,7 @@ async def render_script(
 
     output = config.ASSETS_DIR / "video" / f"{_sanitize_title(request.scriptTitle or 'render')}_{uuid.uuid4().hex}.mp4"
     logger.info("[4/5] Montando e concatenando cenas -> %s", output)
-    _progress("render", 0.0, "Montando cenas")
+    _progress("render", 0.0, "Montando cenas", {"output_path": str(output)})
 
     def _build() -> Path:
         return builder.build_video(
